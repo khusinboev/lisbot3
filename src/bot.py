@@ -1,5 +1,7 @@
 """
-src/bot.py — yangi schema va parser_v3 uchun yangilangan.
+src/bot.py
+Har bir page dan keyin darrov bazaga kiritiladi.
+Xato bo'lsa oldingi pagelar saqlanib qoladi.
 """
 import asyncio
 import os
@@ -17,7 +19,7 @@ from loguru import logger
 
 from database import Database, Certificate
 from parser_v3 import LicenseParserV3 as LicenseParser
-from bot_helpers import send_pdf_document, certificate_caption
+from bot_helpers import send_pdf_document
 from settings import (
     TARGET_ACTIVITY_TYPE,
     DOWNLOAD_DIR,
@@ -47,9 +49,13 @@ scrape_lock = asyncio.Lock()
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="📥 Барча сертификатларни йиғиш", callback_data="scrape_all"))
+    builder.row(InlineKeyboardButton(
+        text="📥 Барча сертификатларни йиғиш", callback_data="scrape_all"
+    ))
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
-    builder.row(InlineKeyboardButton(text="📄 PDF юклаш (саралганлар)", callback_data="download_pdfs"))
+    builder.row(InlineKeyboardButton(
+        text="📄 PDF юклаш (саралганлар)", callback_data="download_pdfs"
+    ))
     return builder.as_markup()
 
 
@@ -62,11 +68,13 @@ def get_confirm_keyboard(action: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _check_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -126,6 +134,7 @@ async def cb_scrape(callback: CallbackQuery):
     await callback.message.edit_text(
         "📥 <b>Barcha sertifikatlarni yig'ish</b>\n\n"
         f"API dan barcha ma'lumotlar olinadi.\n"
+        f"Har bir sahifadan keyin darrov bazaga yoziladi.\n"
         f"«{TARGET_ACTIVITY_TYPE}» bo'yicha avtomatik saralanadi.\n\n"
         "Davom ettirasizmi?",
         parse_mode=ParseMode.HTML,
@@ -141,8 +150,9 @@ async def cb_confirm_scrape(callback: CallbackQuery):
     progress_msg = await callback.message.edit_text(
         "🚀 <b>Yig'ish boshlandi...</b>\n\n"
         "📄 Sahifa: <b>0/0</b>\n"
-        "📋 Yig'ildi: <b>0</b>\n"
-        "🎓 Saralandi: <b>0</b>\n\n⏳ Kuting...",
+        "💾 Saqlandi: <b>0</b>\n"
+        "🎓 Saralandi: <b>0</b>\n\n"
+        "⏳ Kuting...",
         parse_mode=ParseMode.HTML
     )
 
@@ -151,48 +161,52 @@ async def cb_confirm_scrape(callback: CallbackQuery):
             parser = LicenseParser()
             await parser.init_browser(headless=True)
 
-            total_collected = 0
+            # Kauntlar
+            total_saved    = 0
             total_filtered = 0
-            current_page = 0
-            total_pages = 0
+            current_page   = 0
+            total_pages    = 0
 
-            async def progress_callback(page: int, total: int, collected: int):
-                nonlocal total_collected, total_filtered, current_page, total_pages
-                total_collected += collected
+            async def on_page_done(page: int, total: int, page_certs: list):
+                """Har bir page tugagach: DB ga yoz, progress yangilash."""
+                nonlocal total_saved, total_filtered, current_page, total_pages
                 current_page = page
-                total_pages = total
+                total_pages  = total
 
-                # Filtered sonini sanash — yig'ilgan oxirgi batch dan
+                # Shu page dagi sertifikatlarni darrov bazaga kiritamiz
+                for cert in page_certs:
+                    await db.upsert_certificate(cert)
+                    total_saved += 1
+
+                # Filtered soni
+                total_filtered = await db.count_filtered_certificates()
+
+                # Progress xabarini yangilash (har N sahifada yoki oxirida)
                 if page % SCRAPE_UPDATE_EVERY_PAGES == 0 or page == total:
-                    total_filtered = await db.count_filtered_certificates()
                     try:
                         await progress_msg.edit_text(
                             f"🚀 <b>Yig'ish davom etmoqda...</b>\n\n"
                             f"📄 Sahifa: <b>{page}/{total}</b>\n"
-                            f"📋 Yig'ildi: <b>{total_collected}</b>\n"
-                            f"🎓 Saralandi: <b>{total_filtered}</b>\n\n⏳ Kuting...",
+                            f"💾 Saqlandi: <b>{total_saved}</b>\n"
+                            f"🎓 Saralandi: <b>{total_filtered}</b>\n\n"
+                            f"⏳ Kuting...",
                             parse_mode=ParseMode.HTML
                         )
                     except Exception:
                         pass
 
-            # Scrape — parser_v3 API dan to'g'ri Certificate qaytaradi
-            certificates = await parser.scrape_all(progress_callback)
+            # scrape_all endi har page uchun callback chaqiradi
+            # callback ichida page_certs bo'lishi uchun parser_v3 ni moslashtirdik
+            await parser.scrape_all(on_page_done)
 
-            # DB ga saqlash — is_filtered allaqachon set bo'lgan
-            saved = 0
-            for cert in certificates:
-                await db.upsert_certificate(cert)
-                saved += 1
-
-            total_in_db = await db.count_certificates()
+            # Yakuniy statistika
+            total_in_db    = await db.count_certificates()
             filtered_in_db = await db.count_filtered_certificates()
 
             await progress_msg.edit_text(
                 f"✅ <b>Yig'ish yakunlandi!</b>\n\n"
                 f"📄 Sahifalar: <b>{current_page}/{total_pages}</b>\n"
-                f"📋 API dan olindi: <b>{len(certificates)}</b>\n"
-                f"💾 Bazaga saqlandi: <b>{saved}</b>\n"
+                f"💾 Saqlandi: <b>{total_saved}</b>\n"
                 f"🎓 Saralandi («{TARGET_ACTIVITY_TYPE}»): <b>{filtered_in_db}</b>\n"
                 f"📊 Bazada jami: <b>{total_in_db}</b>\n\n"
                 f"Amalni tanlang:",
@@ -202,8 +216,13 @@ async def cb_confirm_scrape(callback: CallbackQuery):
 
         except Exception as e:
             logger.error(f"Scraping xato: {e}")
+            # Xato bo'lsa ham saqlangan ma'lumotlar qoladi
+            saved_so_far = await db.count_certificates()
             await progress_msg.edit_text(
-                f"❌ <b>Xatolik!</b>\n\n{e}\n\nQayta urining:",
+                f"❌ <b>Xatolik yuz berdi!</b>\n\n"
+                f"{e}\n\n"
+                f"💾 Xatogacha saqlangan: <b>{saved_so_far}</b> ta\n\n"
+                f"Qayta urinib ko'ring:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_main_keyboard()
             )
@@ -241,7 +260,8 @@ async def cb_confirm_download(callback: CallbackQuery):
 
         if not filtered_certs:
             await progress_msg.edit_text(
-                "⚠️ Saralgan sertifikatlar topilmadi!\n\nAvval yig'ish jarayonini boshlang:",
+                "⚠️ Saralgan sertifikatlar topilmadi!\n\n"
+                "Avval yig'ish jarayonini boshlang:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_main_keyboard()
             )
@@ -252,7 +272,7 @@ async def cb_confirm_download(callback: CallbackQuery):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         downloaded = 0
-        total = len(filtered_certs)
+        total      = len(filtered_certs)
 
         for i, cert in enumerate(filtered_certs, 1):
             if cert.uuid:
@@ -279,7 +299,9 @@ async def cb_confirm_download(callback: CallbackQuery):
 
         await progress_msg.edit_text(
             f"✅ <b>PDF yuklash yakunlandi!</b>\n\n"
-            f"Jami: <b>{total}</b>\nYuklandi: <b>{downloaded}</b>\n\nAmalni tanlang:",
+            f"Jami: <b>{total}</b>\n"
+            f"Yuklandi: <b>{downloaded}</b>\n\n"
+            f"Amalni tanlang:",
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_keyboard()
         )

@@ -485,6 +485,10 @@ class LicenseParserV3:
         self,
         progress_callback: Optional[Callable] = None,
     ) -> List[Certificate]:
+        """
+        progress_callback(page, total_pages, page_certs) shaklida chaqiriladi.
+        bot.py da har page dan keyin darrov DB ga yozish uchun ishlatiladi.
+        """
         all_certs: List[Certificate] = []
         try:
             total_pages = await self._run(self._worker.get_total_pages)
@@ -494,7 +498,8 @@ class LicenseParserV3:
                 all_certs.extend(certs)
 
                 if progress_callback:
-                    result = progress_callback(page_0 + 1, total_pages, len(certs))
+                    # page_certs ni ham uzatamiz — bot.py darrov DB ga yozsin
+                    result = progress_callback(page_0 + 1, total_pages, certs)
                     if inspect.isawaitable(result):
                         await result
 
