@@ -16,6 +16,7 @@ import random
 import inspect
 
 from settings import BASE_URL, API_URL, DOC_URL
+from fingerprint_patch import STEALTH_INIT_SCRIPT
 
 
 @dataclass
@@ -126,7 +127,6 @@ class LicenseParserV2:
         for attempt in range(1, retries + 1):
             try:
                 await self.page.goto(url, timeout=timeout, wait_until=wait_until)
-                # Light non-deterministic interaction after successful navigation.
                 if random.random() < 0.7:
                     await self._human_browse_noise()
                 return True
@@ -145,7 +145,6 @@ class LicenseParserV2:
             await self.page.goto("https://www.youtube.com", timeout=45000, wait_until='domcontentloaded')
             await self._human_delay(1.2, 2.2)
 
-            # Try to handle consent popups.
             for selector in [
                 "button[aria-label*='Accept']",
                 "button[aria-label*='agree']",
@@ -187,16 +186,13 @@ class LicenseParserV2:
         """Initialize Playwright browser with stealth options"""
         self.playwright = await async_playwright().start()
 
-        # Environment can override launch mode.
         if os.getenv("CHROME_HEADLESS") is not None:
             headless = self._env_bool("CHROME_HEADLESS", default=headless)
         elif self._env_bool("IN_DOCKER", default=False):
             headless = True
         elif os.name == "nt":
-            # Local Windows debugging should be visible by default.
             headless = False
 
-        # Launch persistent context with dedicated profile for better session continuity.
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_dir,
             headless=headless,
@@ -230,7 +226,6 @@ class LicenseParserV2:
                 '--disable-default-apps',
                 '--disable-domain-reliability',
                 '--disable-features=AudioServiceOutOfProcess',
-                '--disable-features=IsolateOrigins,site-per-process',
                 '--disable-hang-monitor',
                 '--disable-ipc-flooding-protection',
                 '--disable-logging',
@@ -253,42 +248,15 @@ class LicenseParserV2:
             accept_downloads=True,
         )
 
-        # Add init script to hide automation
-        await self.context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['uz-UZ', 'ru', 'en-US', 'en']
-            });
-            Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => 8
-            });
-            Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => 8
-            });
-            window.chrome = { runtime: {} };
+        # Full fingerprint hardening — 7 vectors
+        await self.context.add_init_script(STEALTH_INIT_SCRIPT)
 
-            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return originalGetParameter.call(this, parameter);
-            };
-        """)
-
-        # Reuse first tab from persistent context, or create one.
         existing_pages = self.context.pages
         self.page = existing_pages[0] if existing_pages else await self.context.new_page()
         self.browser = self.context.browser
 
-        # Set up route interception
         await self.page.route("**/*", self._handle_route)
 
-        # Do one-time warmup before target navigation.
         await self._youtube_warmup()
 
         logger.info(f"Browser initialized with stealth mode, profile: {self.profile_dir}")
@@ -296,11 +264,8 @@ class LicenseParserV2:
     async def _handle_route(self, route: Route):
         """Handle route interception"""
         request = route.request
-
-        # Capture API responses
         if 'api.licenses.uz' in request.url:
             logger.debug(f"API request: {request.method} {request.url}")
-
         await route.continue_()
 
     async def close(self):
@@ -323,14 +288,11 @@ class LicenseParserV2:
         start_time = asyncio.get_event_loop().time()
 
         while asyncio.get_event_loop().time() - start_time < timeout:
-            # Check if we're past the challenge
             title = await self.page.title()
             if title and 'license' not in title.lower() and 'loading' not in title.lower():
-                # Check for actual content
                 content = await self.page.content()
                 if 'registry' in content.lower() or 'реестр' in content.lower():
                     return True
-
             await asyncio.sleep(1)
 
         return False
@@ -338,7 +300,6 @@ class LicenseParserV2:
     async def get_total_pages(self) -> int:
         """Get total number of pages"""
         try:
-            # Navigate to the registry page
             first_page_url = (
                 f"{self.BASE_URL}/registry?filter%5Bdocument_id%5D=4409&"
                 "filter%5Bdocument_type%5D=LICENSE&page=1"
@@ -347,16 +308,11 @@ class LicenseParserV2:
             if not opened:
                 return 1
 
-            # Wait for Cloudflare
             await self.wait_for_cloudflare()
-
-            # Wait for content to load
             await asyncio.sleep(3)
 
-            # Try to find pagination info using JavaScript
             pagination_info = await self.page.evaluate(r"""
                 () => {
-                    // Look for pagination elements
                     const paginationTexts = document.querySelectorAll('*');
                     for (const el of paginationTexts) {
                         const text = el.textContent;
@@ -377,7 +333,6 @@ class LicenseParserV2:
                 logger.info(f"Total pages: {total_pages}")
                 return total_pages
 
-            # Try to find last page number
             last_page = await self.page.evaluate(r"""
                 () => {
                     const buttons = document.querySelectorAll('button, a');
@@ -403,42 +358,29 @@ class LicenseParserV2:
         certificates = []
 
         try:
-            # Navigate to the page
             url = f"{self.BASE_URL}/registry?filter%5Bdocument_id%5D=4409&filter%5Bdocument_type%5D=LICENSE&page={page_num}"
-
-            # Add random delay
             await self._human_delay(0.3, 1.0)
 
             opened = await self._goto_with_retries(url, wait_until='domcontentloaded', timeout=60000)
             if not opened:
                 return []
 
-            # Wait for content to load
             await asyncio.sleep(2)
 
-            # Extract data using JavaScript
             data = await self.page.evaluate(r"""
                 () => {
                     const results = [];
-
-                    // Look for certificate cards/rows
                     const cards = document.querySelectorAll('[class*="card"], [class*="item"], [class*="row"], tr');
-
                     for (const card of cards) {
                         const cert = {};
-
-                        // Try to extract all text content
                         const text = card.textContent;
 
-                        // Look for document number
                         const docMatch = text.match(/[№N]\s*(\d+)/);
                         if (docMatch) cert.document_number = docMatch[1];
 
-                        // Look for STIR
                         const stirMatch = text.match(/(\d{9})/);
                         if (stirMatch) cert.stir = stirMatch[1];
 
-                        // Look for UUID in links
                         const links = card.querySelectorAll('a[href]');
                         for (const link of links) {
                             const href = link.getAttribute('href');
@@ -447,24 +389,19 @@ class LicenseParserV2:
                                 cert.uuid = uuidMatch[1];
                                 cert.pdf_url = `https://doc.licenses.uz/v1/certificate/uuid/${cert.uuid}/pdf?language=uz`;
                             }
-
-                            // Look for document ID
                             const docIdMatch = href.match(/filter%5Bnumber%5D=(\d+)/);
                             if (docIdMatch) cert.document_id = docIdMatch[1];
                         }
 
-                        // Look for organization name (usually a link or bold text)
                         const orgEl = card.querySelector('a, strong, b');
                         if (orgEl) cert.organization_name = orgEl.textContent.trim();
 
-                        // Look for dates
                         const dateMatches = text.match(/(\d{2}\.\d{2}\.\d{4})/g);
                         if (dateMatches) {
                             cert.issue_date = dateMatches[0];
                             if (dateMatches[1]) cert.expiry_date = dateMatches[1];
                         }
 
-                        // Look for activity type
                         if (text.includes('Олий таълим') || text.includes('Высшее образование')) {
                             cert.activity_type = 'Олий таълим хизматлари';
                         }
@@ -473,12 +410,10 @@ class LicenseParserV2:
                             results.push(cert);
                         }
                     }
-
                     return results;
                 }
             """)
 
-            # If data is not visible yet, wait and refresh once.
             if not data:
                 logger.warning(f"No certificates visible on page {page_num}, waiting and refreshing...")
                 await asyncio.sleep(random.uniform(2.2, 4.0))
@@ -487,9 +422,7 @@ class LicenseParserV2:
                 data = await self.page.evaluate(r"""
                     () => {
                         const results = [];
-
                         const cards = document.querySelectorAll('[class*="card"], [class*="item"], [class*="row"], tr');
-
                         for (const card of cards) {
                             const cert = {};
                             const text = card.textContent;
@@ -508,7 +441,6 @@ class LicenseParserV2:
                                     cert.uuid = uuidMatch[1];
                                     cert.pdf_url = `https://doc.licenses.uz/v1/certificate/uuid/${cert.uuid}/pdf?language=uz`;
                                 }
-
                                 const docIdMatch = href.match(/filter%5Bnumber%5D=(\d+)/);
                                 if (docIdMatch) cert.document_id = docIdMatch[1];
                             }
@@ -530,12 +462,10 @@ class LicenseParserV2:
                                 results.push(cert);
                             }
                         }
-
                         return results;
                     }
                 """)
 
-            # Convert to ParsedCertificate objects
             for item in data:
                 cert = ParsedCertificate(
                     document_id=item.get('document_id'),
@@ -565,7 +495,6 @@ class LicenseParserV2:
         all_certificates = []
 
         try:
-            # Get total pages
             total_pages = await self.get_total_pages()
             logger.info(f"Total pages to scrape: {total_pages}")
 
@@ -573,13 +502,11 @@ class LicenseParserV2:
                 certificates = await self.scrape_page(page_num)
                 all_certificates.extend(certificates)
 
-                # Call progress callback
                 if progress_callback:
                     progress_result = progress_callback(page_num, total_pages, len(certificates))
                     if inspect.isawaitable(progress_result):
                         await progress_result
 
-                # Random delay between pages
                 await asyncio.sleep(random.uniform(0.8, 1.6))
 
             logger.info(f"Total certificates scraped: {len(all_certificates)}")
@@ -641,16 +568,12 @@ class LicenseParserV2:
         """Download PDF file"""
         try:
             pdf_url = f"{self.DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz"
-
-            # Navigate to PDF URL
             response = await self.page.goto(pdf_url, timeout=60000)
 
             if response:
-                # Save the PDF
                 content = await response.body()
                 with open(output_path, 'wb') as f:
                     f.write(content)
-
                 logger.info(f"PDF downloaded: {output_path}")
                 return True
 
