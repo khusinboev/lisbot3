@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from database import Database, Certificate
-from parser_v2 import LicenseParserV2 as LicenseParser
+from parser_v3 import LicenseParserV3 as LicenseParser
 from bot_helpers import to_db_certificate, send_pdf_document
 from settings import (
     TARGET_ACTIVITY_TYPE,
