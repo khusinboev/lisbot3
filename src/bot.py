@@ -5,6 +5,7 @@ Xato bo'lsa oldingi pagelar saqlanib qoladi.
 """
 import asyncio
 import os
+import html
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -220,7 +221,7 @@ async def cb_confirm_scrape(callback: CallbackQuery):
             saved_so_far = await db.count_certificates()
             await progress_msg.edit_text(
                 f"❌ <b>Xatolik yuz berdi!</b>\n\n"
-                f"{e}\n\n"
+                f"{html.escape(str(e))[:300]}\n\n"
                 f"💾 Xatogacha saqlangan: <b>{saved_so_far}</b> ta\n\n"
                 f"Qayta urinib ko'ring:",
                 parse_mode=ParseMode.HTML,
@@ -309,7 +310,7 @@ async def cb_confirm_download(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Download xato: {e}")
         await progress_msg.edit_text(
-            f"❌ <b>Xatolik!</b>\n\n{e}\n\nQayta urining:",
+            f"❌ <b>Xatolik!</b>\n\n{html.escape(str(e))[:300]}\n\nQayta urining:",
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_keyboard()
         )
