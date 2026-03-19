@@ -1,54 +1,62 @@
-"""Shared helper functions for bot handlers."""
-from typing import Any
-
+"""src/bot_helpers.py — yangi Certificate schema uchun."""
+import json
 from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile, Message
-
 from database import Certificate
 
 
-def to_db_certificate(cert: Any) -> Certificate:
-    """Map parsed certificate-like object into DB model."""
-    return Certificate(
-        document_id=getattr(cert, "document_id", None),
-        document_number=getattr(cert, "document_number", None),
-        status=getattr(cert, "status", None),
-        issue_date=getattr(cert, "issue_date", None),
-        inserted_date=getattr(cert, "inserted_date", None),
-        organization_name=getattr(cert, "organization_name", None),
-        address=getattr(cert, "address", None),
-        stir=getattr(cert, "stir", None),
-        expiry_date=getattr(cert, "expiry_date", None),
-        activity_type=getattr(cert, "activity_type", None),
-        uuid=getattr(cert, "uuid", None),
-        pdf_url=getattr(cert, "pdf_url", None),
-    )
-
-
 def certificate_caption(cert: Certificate) -> str:
-    """Build unified PDF caption text."""
-    return (
-        "📄 <b>Сертфикат</b>\n\n"
-        f"🏢 Ташкилот: {cert.organization_name or 'Номаълум'}\n"
-        f"📋 Ҳужжат рақами: {cert.document_number or 'Номаълум'}\n"
-        f"📅 Тақдим этилган сана: {cert.issue_date or 'Номаълум'}\n"
-        f"🏠 Манзил: {cert.address or 'Номаълум'}\n"
-        f"🔢 СТИР: {cert.stir or 'Номаълум'}\n"
-        f"📆 Амал қилиш муддати: {cert.expiry_date or 'Номаълум'}\n"
-        f"🔖 Фаолият тури: {cert.activity_type or 'Номаълум'}"
-    )
+    """Telegram xabar uchun sertifikat matni."""
+    # Manzil
+    parts = [p for p in [cert.region_uz, cert.sub_region_uz, cert.address] if p]
+    manzil = ", ".join(parts) if parts else "Noma'lum"
 
+    # Faoliyat manzili
+    act_addr = ""
+    if cert.activity_addresses:
+        try:
+            addrs = json.loads(cert.activity_addresses)
+            act_addr = "\n".join(f"  • {a}" for a in addrs if a) or ""
+        except Exception:
+            act_addr = cert.activity_addresses
 
-async def safe_edit_text(message: Message, text: str):
-    """Edit a message and ignore transient Telegram edit errors."""
-    try:
-        await message.edit_text(text, parse_mode=ParseMode.HTML)
-    except Exception:
-        return
+    # Faoliyat turlari
+    specs = ""
+    if cert.specializations:
+        try:
+            names = json.loads(cert.specializations)
+            specs = "\n".join(f"  • {s}" for s in names if s) or ""
+        except Exception:
+            specs = cert.specializations
+
+    # Holat emoji
+    status_emoji = "✅" if cert.active else "❌"
+    status_text = cert.status or ("Faol" if cert.active else "Nofaol")
+
+    lines = [
+        f"📄 <b>Sertifikat</b>",
+        f"",
+        f"🏢 <b>Tashkilot:</b> {cert.name or 'Noma\'lum'}",
+        f"🔢 <b>STIR:</b> {cert.tin or 'Noma\'lum'}",
+        f"📋 <b>Hujjat raqami:</b> {cert.number or 'Noma\'lum'}",
+        f"🔖 <b>Reg raqam:</b> {cert.register_number or '—'}",
+        f"📅 <b>Taqdim etilgan:</b> {cert.registration_date or 'Noma\'lum'}",
+        f"📆 <b>Muddati:</b> {cert.expiry_date or 'Belgilanmagan'}",
+        f"📍 <b>Manzil:</b> {manzil}",
+    ]
+
+    if act_addr:
+        lines += [f"🏭 <b>Faoliyat manzili:</b>", act_addr]
+
+    if specs:
+        lines += [f"📚 <b>Faoliyat turlari:</b>", specs]
+
+    lines += [f"{status_emoji} <b>Holat:</b> {status_text}"]
+
+    return "\n".join(lines)
 
 
 async def send_pdf_document(message: Message, output_path: str, cert: Certificate):
-    """Send generated PDF document with a consistent caption format."""
     await message.answer_document(
         document=FSInputFile(output_path),
         caption=certificate_caption(cert),

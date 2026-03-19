@@ -1,20 +1,21 @@
 """
 src/parser_v3.py
-SeleniumBase UC (Undetected Chrome) mode — Turnstile bypass.
+SeleniumBase UC mode + CDP Network interception.
 
-O'rnatish:
-    pip install seleniumbase
+API endpoint: api.licenses.uz/v1/register/open_source
+- page_num: 0-indexed (API currentPage = 0, 1, 2 ...)
+- URL da &page= 1-indexed (&page=1 → currentPage=0)
 
-bot.py da:
-    from parser_v3 import LicenseParserV3 as LicenseParser
+O'rnatish: pip install seleniumbase
+bot.py da: from parser_v3 import LicenseParserV3 as LicenseParser
 """
 import asyncio
 import os
+import time
 import random
 import json
 import base64
-from dataclasses import dataclass
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Dict, Any, Set
 from concurrent.futures import ThreadPoolExecutor
 import inspect
 
@@ -23,95 +24,76 @@ from loguru import logger
 try:
     from seleniumbase import SB
 except ImportError:
-    raise ImportError("seleniumbase o'rnatilmagan: pip install seleniumbase")
+    raise ImportError("pip install seleniumbase")
 
-from settings import BASE_URL, DOC_URL
-
-
-@dataclass
-class ParsedCertificate:
-    document_id: Optional[str] = None
-    document_number: Optional[str] = None
-    status: Optional[str] = None
-    issue_date: Optional[str] = None
-    inserted_date: Optional[str] = None
-    organization_name: Optional[str] = None
-    address: Optional[str] = None
-    stir: Optional[str] = None
-    expiry_date: Optional[str] = None
-    activity_type: Optional[str] = None
-    uuid: Optional[str] = None
-    pdf_url: Optional[str] = None
+from settings import BASE_URL, DOC_URL, TARGET_ACTIVITY_TYPE
+from database import Certificate
 
 
-_PARSE_JS = r"""
-return (function() {
-    const results = [];
-    const cards = document.querySelectorAll(
-        'tr.Table_row__329lz, [class*="tableMobileWrapper"] > *, tr'
-    );
-    for (const card of cards) {
-        const cert = {};
-        const text = card.textContent || '';
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-        for (const a of card.querySelectorAll('a[href]')) {
-            const href = a.getAttribute('href') || '';
-            const m = href.match(/certificate\/uuid\/([a-f0-9\-]{36})/i);
-            if (m) {
-                cert.uuid = m[1];
-                cert.pdf_url = 'https://doc.licenses.uz/v1/certificate/uuid/' + m[1] + '/pdf?language=uz';
-            }
-            const dm = href.match(/filter%5Bnumber%5D=(\d+)/);
-            if (dm) cert.document_id = dm[1];
-        }
+API_TARGET = "api.licenses.uz/v1/register/open_source"
+REGISTRY_BASE = (
+    f"{BASE_URL}/registry"
+    "?filter%5Bdocument_id%5D=4409"
+    "&filter%5Bdocument_type%5D=LICENSE"
+    "&page={page_1indexed}"
+)
 
-        if (!cert.uuid) continue;
 
-        const nm = text.match(/[NNo\u2116]\s*(\d+)/);
-        if (nm) cert.document_number = nm[1];
+# ── API item → Certificate ────────────────────────────────────────────────────
 
-        const sm = text.match(/\b(\d{9})\b/);
-        if (sm) cert.stir = sm[1];
+def _api_item_to_cert(item: Dict[str, Any]) -> Certificate:
+    region = (item.get("region") or {}).get("uz", "")
+    sub_region = (item.get("subRegion") or {}).get("uz", "")
 
-        const org = card.querySelector('a, strong, b, [class*="title"]');
-        if (org) cert.organization_name = (org.textContent || '').trim().slice(0, 200);
+    act_addrs = item.get("activity_addresses") or []
+    act_addrs_uz = [
+        (a.get("value") or {}).get("uz", "")
+        for a in act_addrs if a.get("value")
+    ]
 
-        const dates = text.match(/\d{2}\.\d{2}\.\d{4}/g);
-        if (dates) {
-            cert.issue_date = dates[0];
-            if (dates[1]) cert.expiry_date = dates[1];
-        }
+    specs = item.get("specializations") or []
+    spec_names = [
+        (s.get("name") or {}).get("uz", "") or (s.get("name") or {}).get("oz", "")
+        for s in specs if s.get("name")
+    ]
 
-        if (text.indexOf('\u041e\u043b\u0438\u0439 \u0442\u0430\u044a\u043b\u0438\u043c') !== -1 ||
-            text.indexOf('\u0412\u044b\u0441\u0448\u0435\u0435') !== -1) {
-            cert.activity_type = '\u041e\u043b\u0438\u0439 \u0442\u0430\u044a\u043b\u0438\u043c \u0445\u0438\u0437\u043c\u0430\u0442\u043b\u0430\u0440\u0438';
-        }
+    status_str = (item.get("status") or {}).get("status", "")
 
-        results.push(cert);
-    }
-    return JSON.stringify(results);
-})()
-"""
+    is_filtered = any(
+        TARGET_ACTIVITY_TYPE.lower() in s.lower()
+        for s in spec_names
+    )
 
-_TOTAL_PAGES_JS = r"""
-return (function() {
-    for (const el of document.querySelectorAll('*')) {
-        const t = el.textContent || '';
-        const m = t.match(/(\d+)\s*(\u0438\u0437|of)\s*(\d+)/);
-        if (m) return parseInt(m[3]);
-    }
-    let max = 1;
-    for (const el of document.querySelectorAll('button, a')) {
-        const t = (el.textContent || '').trim();
-        if (/^\d+$/.test(t)) max = Math.max(max, parseInt(t));
-    }
-    return max;
-})()
-"""
+    return Certificate(
+        uuid=item.get("uuid"),
+        register_id=item.get("register_id"),
+        application_id=item.get("application_id"),
+        document_id=item.get("document_id"),
+        number=str(item.get("number") or ""),
+        register_number=item.get("register_number"),
+        name=item.get("name"),
+        tin=str(item.get("tin") or ""),
+        pin=item.get("pin"),
+        region_uz=region,
+        sub_region_uz=sub_region,
+        address=item.get("address"),
+        activity_addresses=json.dumps(act_addrs_uz, ensure_ascii=False) if act_addrs_uz else None,
+        registration_date=item.get("registration_date"),
+        expiry_date=item.get("expiry_date"),
+        revoke_date=item.get("revoke_date"),
+        status=status_str,
+        active=bool(item.get("active", True)),
+        specializations=json.dumps(spec_names, ensure_ascii=False) if spec_names else None,
+        specialization_ids=item.get("specialization_ids"),
+        is_filtered=is_filtered,
+    )
 
+
+# ── Sync worker ───────────────────────────────────────────────────────────────
 
 class _SyncWorker:
-    """SeleniumBase sync driver — thread pool da ishlaydi."""
 
     def __init__(self, headless: bool = True):
         self.headless = headless
@@ -127,6 +109,7 @@ class _SyncWorker:
             locale_code="uz",
         )
         self._sb = self._sb_ctx.__enter__()
+        self._sb.execute_cdp_cmd("Network.enable", {})
         logger.info(f"SeleniumBase UC ishga tushdi (headless={self.headless})")
 
     def stop(self):
@@ -139,154 +122,229 @@ class _SyncWorker:
         self._sb = None
         logger.info("SeleniumBase yopildi")
 
-    def _wait_content(self, timeout: int = 25) -> bool:
-        """Jadval/karta elementlari paydo bo'lishini kut."""
-        import time
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                count = self._sb.execute_script(
-                    "return document.querySelectorAll('tr, [class*=\"row\"], [class*=\"card\"]').length;"
-                )
-                if count and int(count) > 3:
-                    return True
-            except Exception:
-                pass
-            time.sleep(1)
-        return False
+    def _open_page(self, page_0indexed: int, retries: int = 3) -> bool:
+        """
+        page_0indexed: 0-based (birinchi sahifa = 0).
+        URL da &page= 1-based bo'ladi.
+        """
+        url = REGISTRY_BASE.format(page_1indexed=page_0indexed + 1)
+        logger.info(f"URL ochilmoqda: {url}")
 
-    def goto(self, url: str, retries: int = 3) -> bool:
-        import time
         for attempt in range(1, retries + 1):
             try:
-                # UC mode: Cloudflare ni avtomatik bypass qiladi
                 self._sb.uc_open_with_reconnect(url, reconnect_time=4)
-
-                # Turnstile checkbox bo'lsa bosib o'tish
                 try:
                     self._sb.uc_gui_click_captcha()
                 except Exception:
                     pass
-
-                if self._wait_content():
-                    return True
-
-                logger.warning(f"Kontent yo'q (attempt {attempt}/{retries}): {url}")
-                time.sleep(random.uniform(2, 4))
-
+                time.sleep(2)
+                return True
             except Exception as e:
-                logger.warning(f"goto xato (attempt {attempt}/{retries}): {e}")
-                time.sleep(random.uniform(2, 5))
-
+                logger.warning(f"_open_page xato ({attempt}/{retries}): {e}")
+                time.sleep(random.uniform(2, 4))
         return False
 
-    def get_total_pages(self) -> int:
-        try:
-            url = (
-                f"{BASE_URL}/registry?filter%5Bdocument_id%5D=4409"
-                "&filter%5Bdocument_type%5D=LICENSE&page=1"
-            )
-            if not self.goto(url):
-                return 1
+    def _get_api_response(self, expected_page_0indexed: int, timeout: int = 40) -> Optional[Dict]:
+        """
+        CDP performance logs dan API response body ni olamiz.
+        expected_page_0indexed: API currentPage qiymati (0-based).
+        """
+        logger.debug(f"API response kutilmoqda (currentPage={expected_page_0indexed})...")
+        deadline = time.time() + timeout
 
-            result = self._sb.execute_script(_TOTAL_PAGES_JS)
-            if not result:
-                return 1
+        while time.time() < deadline:
+            try:
+                logs = self._sb.driver.get_log("performance")
+            except Exception:
+                time.sleep(0.5)
+                continue
 
-            val = int(result)
-            # val > 100 bo'lsa bu items soni, sahifaga aylantir
-            if val > 100:
-                return (val + 9) // 10
-            return max(1, val)
+            for entry in logs:
+                try:
+                    msg = json.loads(entry["message"])["message"]
 
-        except Exception as e:
-            logger.error(f"get_total_pages xato: {e}")
-            return 1
+                    if msg.get("method") != "Network.responseReceived":
+                        continue
 
-    def scrape_page(self, page_num: int) -> List[ParsedCertificate]:
-        url = (
-            f"{BASE_URL}/registry?filter%5Bdocument_id%5D=4409"
-            f"&filter%5Bdocument_type%5D=LICENSE&page={page_num}"
-        )
-        if not self.goto(url):
-            return []
+                    url = msg["params"]["response"]["url"]
 
-        try:
-            raw = self._sb.execute_script(_PARSE_JS)
-            items = json.loads(raw) if raw else []
+                    # Aniq endpoint ni tekshiramiz
+                    if API_TARGET not in url:
+                        continue
+                    # Stats yoki search endpointlarini o'tkazib yuboramiz
+                    if "stat" in url or "search" in url:
+                        continue
 
-            certs = []
-            for item in items:
-                if not isinstance(item, dict) or not item.get('uuid'):
+                    if msg["params"]["response"]["status"] != 200:
+                        continue
+
+                    request_id = msg["params"]["requestId"]
+                    result = self._sb.execute_cdp_cmd(
+                        "Network.getResponseBody", {"requestId": request_id}
+                    )
+                    body = result.get("body", "")
+                    if not body:
+                        continue
+
+                    if result.get("base64Encoded"):
+                        body = base64.b64decode(body).decode("utf-8")
+
+                    data = json.loads(body)
+                    inner = data.get("data", {})
+
+                    if "certificates" not in inner:
+                        continue
+
+                    current_page = inner.get("currentPage", -1)
+                    if current_page != expected_page_0indexed:
+                        logger.debug(
+                            f"Page mismatch: kutilgan={expected_page_0indexed}, keldi={current_page} — o'tkazildi"
+                        )
+                        continue
+
+                    logger.info(
+                        f"API ushlandi: currentPage={current_page}, "
+                        f"items={len(inner.get('certificates', []))}, "
+                        f"totalPages={inner.get('totalPages')}"
+                    )
+                    return data
+
+                except Exception:
                     continue
-                certs.append(ParsedCertificate(
-                    document_id=item.get('document_id'),
-                    document_number=item.get('document_number'),
-                    stir=item.get('stir'),
-                    organization_name=item.get('organization_name'),
-                    issue_date=item.get('issue_date'),
-                    expiry_date=item.get('expiry_date'),
-                    activity_type=item.get('activity_type'),
-                    uuid=item['uuid'],
-                    pdf_url=item.get('pdf_url'),
-                ))
 
-            logger.info(f"Sahifa {page_num}: {len(certs)} ta sertifikat")
-            return certs
+            time.sleep(0.5)
 
-        except Exception as e:
-            logger.error(f"scrape_page {page_num} xato: {e}")
+        logger.warning(f"API response kelmadi (currentPage={expected_page_0indexed}, timeout={timeout}s)")
+        return None
+
+    def fetch_page(self, page_0indexed: int) -> Optional[Dict]:
+        """
+        Bitta sahifani ochib, raw API data qaytaradi.
+        Ichida retry va refresh logikasi bor (kochirish.py dan).
+        """
+        MAX_RETRIES = 3
+        for attempt in range(1, MAX_RETRIES + 1):
+            logger.info(f"fetch_page(page={page_0indexed}) — urinish {attempt}/{MAX_RETRIES}")
+
+            if not self._open_page(page_0indexed):
+                logger.warning("Sahifa ochilmadi — retry")
+                time.sleep(random.uniform(5, 8))
+                continue
+
+            raw = self._get_api_response(page_0indexed, timeout=40)
+
+            if raw is None:
+                logger.warning("API response kelmadi — refresh...")
+                try:
+                    self._sb.driver.refresh()
+                    time.sleep(random.uniform(4, 6))
+                except Exception:
+                    pass
+                raw = self._get_api_response(page_0indexed, timeout=30)
+
+            if raw is None:
+                logger.warning(f"Urinish {attempt} muvaffaqiyatsiz")
+                time.sleep(random.uniform(5, 10))
+                continue
+
+            return raw
+
+        logger.error(f"fetch_page({page_0indexed}): {MAX_RETRIES} urinishdan keyin ham olinmadi")
+        return None
+
+    def get_total_pages(self) -> int:
+        raw = self.fetch_page(0)
+        if not raw:
+            return 1
+        total = int(raw.get("data", {}).get("totalPages", 1))
+        items = raw.get("data", {}).get("totalItems", "?")
+        logger.info(f"totalPages={total}, totalItems={items}")
+        return max(1, total)
+
+    def scrape_page(self, page_0indexed: int) -> List[Certificate]:
+        raw = self.fetch_page(page_0indexed)
+        if not raw:
             return []
 
-    def get_certificate_details(self, document_id: str) -> Optional[ParsedCertificate]:
-        url = f"{BASE_URL}/registry?filter%5Bnumber%5D={document_id}"
-        if not self.goto(url):
-            return None
-
-        try:
-            data = self._sb.execute_script(r"""
-                return (function() {
-                    const text = document.body ? document.body.textContent : '';
-                    const cert = {};
-                    const um = text.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
-                    if (um) cert.uuid = um[1];
-                    const nm = text.match(/[NNo\u2116]\s*(\d+)/);
-                    if (nm) cert.document_number = nm[1];
-                    const sm = text.match(/\b(\d{9})\b/);
-                    if (sm) cert.stir = sm[1];
-                    const dates = text.match(/\d{2}\.\d{2}\.\d{4}/g);
-                    if (dates) { cert.issue_date=dates[0]; if(dates[1]) cert.expiry_date=dates[1]; }
-                    return cert;
-                })()
-            """)
-
-            cert = ParsedCertificate(document_id=document_id)
-            if data:
-                cert.document_number = data.get('document_number')
-                cert.stir = data.get('stir')
-                cert.issue_date = data.get('issue_date')
-                cert.expiry_date = data.get('expiry_date')
-                cert.uuid = data.get('uuid')
+        raw_certs = raw.get("data", {}).get("certificates") or []
+        certs = []
+        for item in raw_certs:
+            try:
+                cert = _api_item_to_cert(item)
                 if cert.uuid:
-                    cert.pdf_url = f"{DOC_URL}/certificate/uuid/{cert.uuid}/pdf?language=uz"
-            return cert
+                    certs.append(cert)
+            except Exception as e:
+                logger.warning(f"item parse xato: {e}")
 
-        except Exception as e:
-            logger.error(f"get_certificate_details xato: {e}")
-            return None
+        filtered_n = sum(1 for c in certs if c.is_filtered)
+        logger.info(f"Sahifa {page_0indexed}: {len(certs)} ta ({filtered_n} ta filtered)")
+        return certs
+
+    def fetch_new_since(self, existing_numbers: Set[str], max_pages: int = 50) -> List[Certificate]:
+        """
+        Bazada mavjud bo'lmagan yangi sertifikatlarni oladi.
+        Birinchi sahifadan boshlab, bazada mavjud raqam uchragan sahifada to'xtaydi.
+        Botda "Yangilarni tekshirish" uchun.
+        """
+        new_certs: List[Certificate] = []
+        page = 0
+
+        while page < max_pages:
+            logger.info(f"fetch_new_since: page {page} yuklanmoqda...")
+            raw = self.fetch_page(page)
+            if not raw:
+                break
+
+            items = raw.get("data", {}).get("certificates") or []
+            if not items:
+                break
+
+            page_has_existing = False
+            for item in items:
+                number = item.get("number")
+                if number is None:
+                    continue
+
+                try:
+                    normalized = str(int(str(number).strip()))
+                except (TypeError, ValueError):
+                    normalized = str(number).strip()
+
+                if not normalized:
+                    continue
+
+                if normalized in existing_numbers:
+                    page_has_existing = True
+                    continue
+
+                try:
+                    cert = _api_item_to_cert(item)
+                    if cert.uuid:
+                        new_certs.append(cert)
+                except Exception as e:
+                    logger.warning(f"item parse xato: {e}")
+
+            if page_has_existing:
+                logger.info(f"fetch_new_since: mavjud yozuv topildi, to'xtatildi (page={page})")
+                break
+
+            page += 1
+            time.sleep(random.uniform(0.5, 1.2))
+
+        logger.info(f"fetch_new_since: {len(new_certs)} ta yangi yozuv topildi")
+        return new_certs
 
     def download_pdf(self, uuid: str, output_path: str) -> bool:
         try:
             pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz"
-
             content = self._sb.execute_async_script("""
                 const done = arguments[arguments.length - 1];
                 fetch(arguments[0])
                     .then(r => r.arrayBuffer())
                     .then(buf => {
-                        const bytes = new Uint8Array(buf);
+                        const b = new Uint8Array(buf);
                         let s = '';
-                        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+                        for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
                         done(btoa(s));
                     })
                     .catch(() => done(null));
@@ -297,37 +355,30 @@ class _SyncWorker:
                     f.write(base64.b64decode(content))
                 logger.info(f"PDF saqlandi: {output_path}")
                 return True
-
             return False
-
         except Exception as e:
             logger.error(f"download_pdf xato: {e}")
             return False
 
 
+# ── Async wrapper ─────────────────────────────────────────────────────────────
+
 class LicenseParserV3:
-    """
-    Async wrapper — bot.py bilan to'liq mos interfeys.
-    SeleniumBase sync driver ThreadPoolExecutor da ishlaydi.
-    """
+    """Async wrapper — bot.py bilan to'liq mos interfeys."""
 
     def __init__(self):
         self._worker: Optional[_SyncWorker] = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sbworker")
 
     async def _run(self, fn, *args):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._executor, fn, *args)
+        return await asyncio.get_event_loop().run_in_executor(self._executor, fn, *args)
 
     async def init_browser(self, headless: bool = True):
-        # .env dan override
-        env_val = os.getenv("CHROME_HEADLESS")
-        if env_val is not None:
-            headless = env_val.strip().lower() in {"1", "true", "yes", "y", "on"}
+        env = os.getenv("CHROME_HEADLESS")
+        if env is not None:
+            headless = env.strip().lower() in {"1", "true", "yes", "y", "on"}
         elif os.name == "nt":
-            # Windows: default GUI (debug qulay)
-            headless = False
-
+            headless = False  # Windows: GUI ko'rsatish (debug)
         self._worker = _SyncWorker(headless=headless)
         await self._run(self._worker.start)
 
@@ -337,41 +388,42 @@ class LicenseParserV3:
             self._worker = None
         self._executor.shutdown(wait=False)
 
-    async def get_total_pages(self) -> int:
-        return await self._run(self._worker.get_total_pages)
-
-    async def scrape_page(self, page_num: int) -> List[ParsedCertificate]:
-        return await self._run(self._worker.scrape_page, page_num)
-
     async def scrape_all(
         self,
         progress_callback: Optional[Callable] = None,
-    ) -> List[ParsedCertificate]:
-        all_certs = []
+    ) -> List[Certificate]:
+        all_certs: List[Certificate] = []
         try:
-            total_pages = await self.get_total_pages()
-            logger.info(f"Jami sahifalar: {total_pages}")
+            total_pages = await self._run(self._worker.get_total_pages)
 
-            for page_num in range(1, total_pages + 1):
-                certs = await self.scrape_page(page_num)
+            # get_total_pages ichida page=0 allaqachon ochildi
+            # birinchi sahifa natijasini qaytarib olish uchun scrape_page(0) ni chaqiramiz
+            # lekin fetch_page(0) qayta so'rov yuborar — shuning uchun
+            # get_total_pages o'zida scrape qilib qaytarsa yaxshi bo'lardi,
+            # ammo hozir sodda variant: page 0 dan boshamiz
+            for page_0 in range(0, total_pages):
+                certs = await self._run(self._worker.scrape_page, page_0)
                 all_certs.extend(certs)
 
                 if progress_callback:
-                    result = progress_callback(page_num, total_pages, len(certs))
+                    result = progress_callback(page_0 + 1, total_pages, len(certs))
                     if inspect.isawaitable(result):
                         await result
 
-                await asyncio.sleep(random.uniform(0.5, 1.2))
+                await asyncio.sleep(random.uniform(0.3, 0.8))
 
             logger.info(f"Jami yig'ildi: {len(all_certs)}")
             return all_certs
-
         except Exception as e:
             logger.error(f"scrape_all xato: {e}")
             return all_certs
 
-    async def get_certificate_details(self, document_id: str) -> Optional[ParsedCertificate]:
-        return await self._run(self._worker.get_certificate_details, document_id)
+    async def fetch_new_since(self, existing_numbers: Set[str], max_pages: int = 50) -> List[Certificate]:
+        """Bot da yangilarni tekshirish uchun."""
+        return await self._run(self._worker.fetch_new_since, existing_numbers, max_pages)
 
     async def download_pdf(self, uuid: str, output_path: str) -> bool:
         return await self._run(self._worker.download_pdf, uuid, output_path)
+
+    async def get_certificate_details(self, document_id: str):
+        return None
