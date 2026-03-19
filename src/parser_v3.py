@@ -133,6 +133,31 @@ class _SyncWorker:
 
     # ── Driver ────────────────────────────────────────────────────────────────
 
+    def _detect_chrome_binary(self) -> Optional[str]:
+        """Chrome binary path ni aniqlash."""
+        import shutil
+        env_path = os.getenv("CHROME_BINARY", "").strip()
+        if env_path and os.path.isfile(env_path):
+            return env_path
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+            "/snap/bin/google-chrome",
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                logger.info(f"Chrome topildi: {path}")
+                return path
+        for name in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+            found = shutil.which(name)
+            if found:
+                logger.info(f"Chrome PATH dan: {found}")
+                return found
+        return None
+
     def _init_driver(self):
         options = uc.ChromeOptions()
         options.add_argument(f"--user-data-dir={self._profile_dir}")
@@ -143,15 +168,21 @@ class _SyncWorker:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
-        # Linux headless uchun qo'shimcha flaglar
-        if os.name != "nt":
-            options.add_argument("--disable-software-rasterizer")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--single-process")
         options.add_argument("--window-size=1280,900")
+
+        if os.name != "nt":
+            options.add_argument("--no-zygote")
+            options.add_argument("--single-process")
 
         if self.headless:
             options.add_argument("--headless=new")
+
+        # Chrome binary — Linux da aniq ko'rsatish kerak
+        chrome_binary = self._detect_chrome_binary()
+        if chrome_binary:
+            options.binary_location = chrome_binary
+        else:
+            logger.warning("Chrome binary topilmadi! CHROME_BINARY ni .env ga qo'shing.")
 
         # Performance log — CDP response body ushlash uchun SHART
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
