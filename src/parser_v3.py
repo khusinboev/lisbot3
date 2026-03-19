@@ -170,10 +170,6 @@ class _SyncWorker:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1280,900")
 
-        if os.name != "nt":
-            options.add_argument("--no-zygote")
-            options.add_argument("--single-process")
-
         if self.headless:
             options.add_argument("--headless=new")
 
