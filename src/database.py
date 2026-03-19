@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from pathlib import Path
+from settings import DB_PATH
 
 
 @dataclass
@@ -33,7 +34,7 @@ class Certificate:
 class Database:
     """SQLite database manager"""
     
-    def __init__(self, db_path: str = "data/certificates.db"):
+    def __init__(self, db_path: str = DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -240,7 +241,7 @@ class Database:
             certificates = []
             for row in rows:
                 certificates.append(Certificate(
-                    id=row[0],
+                    id=row[1],
                     document_id=row[2],
                     document_number=row[3],
                     status=row[4],

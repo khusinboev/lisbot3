@@ -3,6 +3,7 @@ Improved Parser module for scraping license.gov.uz
 Uses Playwright with stealth mode to bypass Cloudflare protection
 """
 import asyncio
+import os
 from typing import List, Dict, Optional, Callable
 from playwright.async_api import async_playwright, Page, Route
 from bs4 import BeautifulSoup
@@ -12,6 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from loguru import logger
 import random
+import inspect
+
+from settings import BASE_URL, API_URL, DOC_URL
 
 
 @dataclass
@@ -34,9 +38,9 @@ class ParsedCertificate:
 class LicenseParserV2:
     """Improved parser for license.gov.uz with better Cloudflare bypass"""
 
-    BASE_URL = "https://license.gov.uz"
-    API_URL = "https://api.licenses.uz/v2"
-    DOC_URL = "https://doc.licenses.uz/v1"
+    BASE_URL = BASE_URL
+    API_URL = API_URL
+    DOC_URL = DOC_URL
 
     def __init__(self):
         self.browser = None
@@ -44,13 +48,157 @@ class LicenseParserV2:
         self.page = None
         self.playwright = None
         self.captured_data = []
+        self.profile_dir = self._resolve_profile_dir()
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _resolve_profile_dir(self) -> str:
+        """Resolve a dedicated persistent profile directory for parser v2."""
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        default_dir = os.path.abspath(
+            os.path.join(current_dir, "..", "data", "chrome_profile_parser_v2")
+        )
+        profile_dir = (
+            os.getenv("PARSER_V2_PROFILE_DIR")
+            or os.getenv("CHROME_PROFILE_DIR")
+            or default_dir
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
+
+    async def _human_delay(self, min_seconds: float = 0.4, max_seconds: float = 1.2):
+        await asyncio.sleep(random.uniform(min_seconds, max_seconds))
+
+    async def _human_mouse_move(self, steps: int | None = None):
+        """Random mouse movement to mimic real browsing behavior."""
+        if not self.page:
+            return
+
+        width, height = 1920, 1080
+        if self.page.viewport_size:
+            width = self.page.viewport_size.get("width", width)
+            height = self.page.viewport_size.get("height", height)
+
+        points = steps or random.randint(3, 7)
+        for _ in range(points):
+            x = random.randint(80, max(120, width - 80))
+            y = random.randint(80, max(120, height - 80))
+            await self.page.mouse.move(x, y, steps=random.randint(8, 20))
+            await self._human_delay(0.08, 0.3)
+
+    async def _human_scroll(self):
+        """Scroll down/up with random increments like a human."""
+        if not self.page:
+            return
+
+        for _ in range(random.randint(2, 4)):
+            await self.page.mouse.wheel(0, random.randint(220, 550))
+            await self._human_delay(0.25, 0.75)
+
+        await self.page.mouse.wheel(0, -random.randint(140, 320))
+        await self._human_delay(0.2, 0.5)
+
+    async def _type_humanlike(self, text: str):
+        """Type text with per-character delay."""
+        if not self.page:
+            return
+
+        for ch in text:
+            await self.page.keyboard.type(ch, delay=random.randint(35, 140))
+
+    async def _human_browse_noise(self):
+        """Small set of random interactions to reduce deterministic behavior."""
+        await self._human_mouse_move()
+        await self._human_scroll()
+
+    async def _goto_with_retries(
+        self,
+        url: str,
+        wait_until: str = 'domcontentloaded',
+        timeout: int = 60000,
+        retries: int = 3,
+    ) -> bool:
+        for attempt in range(1, retries + 1):
+            try:
+                await self.page.goto(url, timeout=timeout, wait_until=wait_until)
+                # Light non-deterministic interaction after successful navigation.
+                if random.random() < 0.7:
+                    await self._human_browse_noise()
+                return True
+            except Exception as e:
+                logger.warning(f"Navigation failed (attempt {attempt}/{retries}) for {url}: {e}")
+                await asyncio.sleep(random.uniform(1.8, 3.5) + (attempt * 0.4))
+        return False
+
+    async def _youtube_warmup(self):
+        """Optional warmup flow before target site to reduce early blocking."""
+        if self._env_bool("SKIP_WARMUP", default=False):
+            logger.info("Warmup skipped by SKIP_WARMUP=true")
+            return
+
+        try:
+            await self.page.goto("https://www.youtube.com", timeout=45000, wait_until='domcontentloaded')
+            await self._human_delay(1.2, 2.2)
+
+            # Try to handle consent popups.
+            for selector in [
+                "button[aria-label*='Accept']",
+                "button[aria-label*='agree']",
+                "button[aria-label*='Reject']",
+                "ytd-button-renderer button",
+            ]:
+                try:
+                    btn = self.page.locator(selector).first
+                    if await btn.count() > 0:
+                        await btn.click(timeout=1200)
+                        await self._human_delay(0.6, 1.2)
+                        break
+                except Exception:
+                    continue
+
+            await self._human_mouse_move()
+
+            search_box = self.page.locator("input[name='search_query']")
+            if await search_box.count() > 0:
+                await search_box.first.click()
+                await self._human_delay(0.35, 0.85)
+                await self._type_humanlike(random.choice([
+                    "python tutorial",
+                    "uzbekistan",
+                    "telegram bot",
+                    "news today",
+                ]))
+                await self._human_delay(0.5, 1.0)
+                await self.page.keyboard.press("Enter")
+                await self._human_delay(1.4, 2.8)
+                await self._human_scroll()
+                await self._human_mouse_move()
+
+            logger.info("Warmup completed")
+        except Exception as e:
+            logger.debug(f"Warmup skipped due to transient error: {e}")
 
     async def init_browser(self, headless: bool = True):
         """Initialize Playwright browser with stealth options"""
         self.playwright = await async_playwright().start()
 
-        # Launch browser with stealth options
-        self.browser = await self.playwright.chromium.launch(
+        # Environment can override launch mode.
+        if os.getenv("CHROME_HEADLESS") is not None:
+            headless = self._env_bool("CHROME_HEADLESS", default=headless)
+        elif self._env_bool("IN_DOCKER", default=False):
+            headless = True
+        elif os.name == "nt":
+            # Local Windows debugging should be visible by default.
+            headless = False
+
+        # Launch persistent context with dedicated profile for better session continuity.
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=self.profile_dir,
             headless=headless,
             args=[
                 '--no-sandbox',
@@ -93,11 +241,7 @@ class LicenseParserV2:
                 '--no-first-run',
                 '--password-store=basic',
                 '--use-mock-keychain',
-            ]
-        )
-
-        # Create context with realistic settings
-        self.context = await self.browser.new_context(
+            ],
             viewport={'width': 1920, 'height': 1080},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             locale='uz-UZ',
@@ -117,16 +261,37 @@ class LicenseParserV2:
             Object.defineProperty(navigator, 'plugins', {
                 get: () => [1, 2, 3, 4, 5]
             });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['uz-UZ', 'ru', 'en-US', 'en']
+            });
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8
+            });
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8
+            });
             window.chrome = { runtime: {} };
+
+            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return originalGetParameter.call(this, parameter);
+            };
         """)
 
-        # Create page
-        self.page = await self.context.new_page()
+        # Reuse first tab from persistent context, or create one.
+        existing_pages = self.context.pages
+        self.page = existing_pages[0] if existing_pages else await self.context.new_page()
+        self.browser = self.context.browser
 
         # Set up route interception
         await self.page.route("**/*", self._handle_route)
 
-        logger.info("Browser initialized with stealth mode")
+        # Do one-time warmup before target navigation.
+        await self._youtube_warmup()
+
+        logger.info(f"Browser initialized with stealth mode, profile: {self.profile_dir}")
 
     async def _handle_route(self, route: Route):
         """Handle route interception"""
@@ -140,10 +305,17 @@ class LicenseParserV2:
 
     async def close(self):
         """Close browser"""
-        if self.browser:
-            await self.browser.close()
+        if self.context:
+            await self.context.close()
+            self.context = None
+
+        self.page = None
+        self.browser = None
+
         if self.playwright:
             await self.playwright.stop()
+            self.playwright = None
+
         logger.info("Browser closed")
 
     async def wait_for_cloudflare(self, timeout: int = 30):
@@ -167,20 +339,22 @@ class LicenseParserV2:
         """Get total number of pages"""
         try:
             # Navigate to the registry page
-            await self.page.goto(
-                f"{self.BASE_URL}/registry?filter%5Bdocument_id%5D=4409&filter%5Bdocument_type%5D=LICENSE&page=1",
-                timeout=60000,
-                wait_until='domcontentloaded'
+            first_page_url = (
+                f"{self.BASE_URL}/registry?filter%5Bdocument_id%5D=4409&"
+                "filter%5Bdocument_type%5D=LICENSE&page=1"
             )
+            opened = await self._goto_with_retries(first_page_url, wait_until='domcontentloaded', timeout=60000)
+            if not opened:
+                return 1
 
             # Wait for Cloudflare
             await self.wait_for_cloudflare()
 
             # Wait for content to load
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
             # Try to find pagination info using JavaScript
-            pagination_info = await self.page.evaluate("""
+            pagination_info = await self.page.evaluate(r"""
                 () => {
                     // Look for pagination elements
                     const paginationTexts = document.querySelectorAll('*');
@@ -204,7 +378,7 @@ class LicenseParserV2:
                 return total_pages
 
             # Try to find last page number
-            last_page = await self.page.evaluate("""
+            last_page = await self.page.evaluate(r"""
                 () => {
                     const buttons = document.querySelectorAll('button, a');
                     let maxPage = 1;
@@ -233,15 +407,17 @@ class LicenseParserV2:
             url = f"{self.BASE_URL}/registry?filter%5Bdocument_id%5D=4409&filter%5Bdocument_type%5D=LICENSE&page={page_num}"
 
             # Add random delay
-            await asyncio.sleep(random.uniform(1, 3))
+            await self._human_delay(0.3, 1.0)
 
-            await self.page.goto(url, timeout=60000, wait_until='domcontentloaded')
+            opened = await self._goto_with_retries(url, wait_until='domcontentloaded', timeout=60000)
+            if not opened:
+                return []
 
             # Wait for content to load
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
             # Extract data using JavaScript
-            data = await self.page.evaluate("""
+            data = await self.page.evaluate(r"""
                 () => {
                     const results = [];
 
@@ -302,6 +478,63 @@ class LicenseParserV2:
                 }
             """)
 
+            # If data is not visible yet, wait and refresh once.
+            if not data:
+                logger.warning(f"No certificates visible on page {page_num}, waiting and refreshing...")
+                await asyncio.sleep(random.uniform(2.2, 4.0))
+                await self.page.reload(timeout=60000, wait_until='domcontentloaded')
+                await asyncio.sleep(2)
+                data = await self.page.evaluate(r"""
+                    () => {
+                        const results = [];
+
+                        const cards = document.querySelectorAll('[class*="card"], [class*="item"], [class*="row"], tr');
+
+                        for (const card of cards) {
+                            const cert = {};
+                            const text = card.textContent;
+
+                            const docMatch = text.match(/[№N]\s*(\d+)/);
+                            if (docMatch) cert.document_number = docMatch[1];
+
+                            const stirMatch = text.match(/(\d{9})/);
+                            if (stirMatch) cert.stir = stirMatch[1];
+
+                            const links = card.querySelectorAll('a[href]');
+                            for (const link of links) {
+                                const href = link.getAttribute('href');
+                                const uuidMatch = href.match(/certificate\/uuid\/([a-f0-9-]+)/i);
+                                if (uuidMatch) {
+                                    cert.uuid = uuidMatch[1];
+                                    cert.pdf_url = `https://doc.licenses.uz/v1/certificate/uuid/${cert.uuid}/pdf?language=uz`;
+                                }
+
+                                const docIdMatch = href.match(/filter%5Bnumber%5D=(\d+)/);
+                                if (docIdMatch) cert.document_id = docIdMatch[1];
+                            }
+
+                            const orgEl = card.querySelector('a, strong, b');
+                            if (orgEl) cert.organization_name = orgEl.textContent.trim();
+
+                            const dateMatches = text.match(/(\d{2}\.\d{2}\.\d{4})/g);
+                            if (dateMatches) {
+                                cert.issue_date = dateMatches[0];
+                                if (dateMatches[1]) cert.expiry_date = dateMatches[1];
+                            }
+
+                            if (text.includes('Олий таълим') || text.includes('Высшее образование')) {
+                                cert.activity_type = 'Олий таълим хизматлари';
+                            }
+
+                            if (cert.uuid || cert.document_number) {
+                                results.push(cert);
+                            }
+                        }
+
+                        return results;
+                    }
+                """)
+
             # Convert to ParsedCertificate objects
             for item in data:
                 cert = ParsedCertificate(
@@ -342,10 +575,12 @@ class LicenseParserV2:
 
                 # Call progress callback
                 if progress_callback:
-                    progress_callback(page_num, total_pages, len(certificates))
+                    progress_result = progress_callback(page_num, total_pages, len(certificates))
+                    if inspect.isawaitable(progress_result):
+                        await progress_result
 
                 # Random delay between pages
-                await asyncio.sleep(random.uniform(2, 5))
+                await asyncio.sleep(random.uniform(0.8, 1.6))
 
             logger.info(f"Total certificates scraped: {len(all_certificates)}")
             return all_certificates
@@ -353,6 +588,54 @@ class LicenseParserV2:
         except Exception as e:
             logger.error(f"Error scraping all pages: {e}")
             return all_certificates
+
+    async def get_certificate_details(self, document_id: str) -> Optional[ParsedCertificate]:
+        """Get certificate details by document ID for update flow compatibility."""
+        try:
+            url = f"{self.BASE_URL}/registry?filter%5Bnumber%5D={document_id}"
+            opened = await self._goto_with_retries(url, wait_until='domcontentloaded', timeout=60000)
+            if not opened:
+                return None
+            await asyncio.sleep(2)
+
+            data = await self.page.evaluate(r"""
+                () => {
+                    const cert = {};
+                    const text = document.body ? document.body.textContent : "";
+
+                    const uuidMatch = text.match(/([a-f0-9]{8}-[a-f0-9-]{27})/i);
+                    if (uuidMatch) cert.uuid = uuidMatch[1];
+
+                    const docNumMatch = text.match(/[№N]\s*(\d+)/);
+                    if (docNumMatch) cert.document_number = docNumMatch[1];
+
+                    const stirMatch = text.match(/\b\d{9}\b/);
+                    if (stirMatch) cert.stir = stirMatch[0];
+
+                    const dateMatches = text.match(/(\d{2}\.\d{2}\.\d{4})/g);
+                    if (dateMatches && dateMatches.length > 0) {
+                        cert.issue_date = dateMatches[0];
+                        if (dateMatches.length > 1) cert.expiry_date = dateMatches[1];
+                    }
+
+                    return cert;
+                }
+            """)
+
+            cert = ParsedCertificate(
+                document_id=document_id,
+                document_number=data.get('document_number'),
+                stir=data.get('stir'),
+                issue_date=data.get('issue_date'),
+                expiry_date=data.get('expiry_date'),
+                uuid=data.get('uuid'),
+            )
+            if cert.uuid:
+                cert.pdf_url = f"{self.DOC_URL}/certificate/uuid/{cert.uuid}/pdf?language=uz"
+            return cert
+        except Exception as e:
+            logger.error(f"Error getting certificate details: {e}")
+            return None
 
     async def download_pdf(self, uuid: str, output_path: str) -> bool:
         """Download PDF file"""

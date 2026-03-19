@@ -60,6 +60,16 @@ Kerakli o'zgaruvchilar:
 - `BOT_TOKEN` - Telegram bot token (@BotFather dan oling)
 - `ADMIN_IDS` - Admin foydalanuvchi IDlari (vergul bilan ajratilgan)
 
+Ixtiyoriy (performance va path sozlamalari):
+- `DB_PATH` - SQLite fayl yo'li (default: `data/certificates.db`)
+- `DOWNLOAD_DIR` - PDF saqlash katalogi (default: `downloads`)
+- `TARGET_ACTIVITY_TYPE` - Saralash activity type matni
+- `SCRAPE_UPDATE_EVERY_PAGES` - Scrape progress nechta sahifada yangilansin
+- `UPDATE_PROGRESS_EVERY_ITEMS` - Update progress nechta elementda yangilansin
+- `DOWNLOAD_PROGRESS_EVERY_ITEMS` - Download progress nechta elementda yangilansin
+- `UPDATE_ITEM_DELAY_SECONDS` - Update jarayonidagi kechikish (sekund)
+- `DOWNLOAD_ITEM_DELAY_SECONDS` - Download jarayonidagi kechikish (sekund)
+
 ## Ishga tushirish
 
 ### Oddiy ishga tushirish

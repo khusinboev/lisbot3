@@ -7,8 +7,8 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, 
-    InlineKeyboardButton, FSInputFile
+    Message, CallbackQuery, InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -16,7 +16,18 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from database import Database, Certificate
-from parser import LicenseParser, ParsedCertificate
+from parser_v2 import LicenseParserV2 as LicenseParser
+from bot_helpers import to_db_certificate, send_pdf_document
+from settings import (
+    TARGET_ACTIVITY_TYPE,
+    DOWNLOAD_DIR,
+    SCRAPE_UPDATE_EVERY_PAGES,
+    UPDATE_PROGRESS_EVERY_ITEMS,
+    DOWNLOAD_PROGRESS_EVERY_ITEMS,
+    UPDATE_ITEM_DELAY_SECONDS,
+    DOWNLOAD_ITEM_DELAY_SECONDS,
+    parse_admin_ids,
+)
 
 # Load environment variables
 load_dotenv()
@@ -27,10 +38,7 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set")
 
 # Admin user IDs (comma-separated)
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
-
-# Activity type to filter
-TARGET_ACTIVITY_TYPE = "Олий таълим хизматлари"
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -43,7 +51,7 @@ db = Database()
 parser: Optional[LicenseParser] = None
 
 # Scraping state
-is_scraping = False
+scrape_lock = asyncio.Lock()
 
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
@@ -160,9 +168,7 @@ async def callback_scrape(callback: CallbackQuery):
     """Handle scrape all callback"""
     await callback.answer()
     
-    global is_scraping
-    
-    if is_scraping:
+    if scrape_lock.locked():
         await callback.message.answer(
             "⚠️ Йиғиш жараёни давом этмоқда. Кутинг..."
         )
@@ -181,9 +187,7 @@ async def callback_scrape(callback: CallbackQuery):
 async def confirm_scrape(callback: CallbackQuery):
     """Confirm scraping"""
     await callback.answer()
-    global is_scraping, parser
-    
-    is_scraping = True
+    global parser
     
     # Send initial message
     progress_msg = await callback.message.edit_text(
@@ -194,89 +198,74 @@ async def confirm_scrape(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
     
-    try:
-        # Initialize parser
-        parser = LicenseParser()
-        await parser.init_browser(headless=True)
-        
-        total_collected = 0
-        current_page = 0
-        total_pages = 0
-        
-        async def progress_callback(page: int, total: int, collected: int):
-            """Update progress"""
-            nonlocal total_collected, current_page, total_pages
-            total_collected += collected
-            current_page = page
-            total_pages = total
-            
-            # Update message every 5 pages
-            if page % 5 == 0 or page == total:
-                try:
-                    await progress_msg.edit_text(
-                        f"🚀 <b>Йиғиш давом этмоқда...</b>\n\n"
-                        f"📄 Саҳифа: <b>{page}/{total}</b>\n"
-                        f"📋 Жами йигилди: <b>{total_collected}</b>\n\n"
-                        f"⏳ Кутинг...",
-                        parse_mode=ParseMode.HTML
-                    )
-                except:
-                    pass
-        
-        # Scrape all certificates
-        certificates = await parser.scrape_all(progress_callback)
-        
-        # Save to database
-        saved_count = 0
-        for cert in certificates:
-            db_cert = Certificate(
-                document_id=cert.document_id,
-                document_number=cert.document_number,
-                status=cert.status,
-                issue_date=cert.issue_date,
-                inserted_date=cert.inserted_date,
-                organization_name=cert.organization_name,
-                address=cert.address,
-                stir=cert.stir,
-                expiry_date=cert.expiry_date,
-                activity_type=cert.activity_type,
-                uuid=cert.uuid,
-                pdf_url=cert.pdf_url
+    async with scrape_lock:
+        try:
+            # Initialize parser
+            parser = LicenseParser()
+            await parser.init_browser(headless=True)
+
+            total_collected = 0
+            current_page = 0
+            total_pages = 0
+
+            async def progress_callback(page: int, total: int, collected: int):
+                """Update progress"""
+                nonlocal total_collected, current_page, total_pages
+                total_collected += collected
+                current_page = page
+                total_pages = total
+
+                if page % SCRAPE_UPDATE_EVERY_PAGES == 0 or page == total:
+                    try:
+                        await progress_msg.edit_text(
+                            f"🚀 <b>Йиғиш давом этмоқда...</b>\n\n"
+                            f"📄 Саҳифа: <b>{page}/{total}</b>\n"
+                            f"📋 Жами йигилди: <b>{total_collected}</b>\n\n"
+                            f"⏳ Кутинг...",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+
+            # Scrape all certificates
+            certificates = await parser.scrape_all(progress_callback)
+
+            # Save to database
+            saved_count = 0
+            for cert in certificates:
+                await db.add_certificate(to_db_certificate(cert))
+                saved_count += 1
+
+            # Update stats
+            total_in_db = await db.count_certificates()
+            await db.update_stats(total=total_in_db)
+
+            # Send completion message
+            await progress_msg.edit_text(
+                f"✅ <b>Йиғиш якунланди!</b>\n\n"
+                f"📄 Саҳифалар: <b>{current_page}/{total_pages}</b>\n"
+                f"📋 Жами йигилди: <b>{len(certificates)}</b>\n"
+                f"💾 Сақланди: <b>{saved_count}</b>\n"
+                f"📊 Базада жами: <b>{total_in_db}</b>\n\n"
+                f"Танловни амалга оширинг:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard()
             )
-            await db.add_certificate(db_cert)
-            saved_count += 1
-        
-        # Update stats
-        total_in_db = await db.count_certificates()
-        await db.update_stats(total=total_in_db)
-        
-        # Send completion message
-        await progress_msg.edit_text(
-            f"✅ <b>Йиғиш якунланди!</b>\n\n"
-            f"📄 Саҳифалар: <b>{current_page}/{total_pages}</b>\n"
-            f"📋 Жами йигилди: <b>{len(certificates)}</b>\n"
-            f"💾 Сақланди: <b>{saved_count}</b>\n"
-            f"📊 Базада жами: <b>{total_in_db}</b>\n\n"
-            f"Танловни амалга оширинг:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_main_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Error during scraping: {e}")
-        await progress_msg.edit_text(
-            f"❌ <b>Хатолик юз берди!</b>\n\n"
-            f"{str(e)}\n\n"
-            f"Қайта уриниб кўринг:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_main_keyboard()
-        )
-    
-    finally:
-        is_scraping = False
-        if parser:
-            await parser.close()
-            parser = None
+
+        except Exception as e:
+            logger.error(f"Error during scraping: {e}")
+            await progress_msg.edit_text(
+                f"❌ <b>Хатолик юз берди!</b>\n\n"
+                f"{str(e)}\n\n"
+                f"Қайта уриниб кўринг:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard()
+            )
+
+        finally:
+            if parser:
+                await parser.close()
+                parser = None
 
 
 @dp.callback_query(F.data == "filter_activity")
@@ -398,25 +387,14 @@ async def confirm_update(callback: CallbackQuery):
                 
                 if updated_cert:
                     # Update in database
-                    db_cert = Certificate(
-                        document_id=updated_cert.document_id,
-                        document_number=updated_cert.document_number,
-                        status=updated_cert.status,
-                        issue_date=updated_cert.issue_date,
-                        inserted_date=updated_cert.inserted_date,
-                        organization_name=updated_cert.organization_name,
-                        address=updated_cert.address,
-                        stir=updated_cert.stir,
-                        expiry_date=updated_cert.expiry_date,
-                        activity_type=updated_cert.activity_type,
-                        uuid=updated_cert.uuid or cert.uuid,
-                        pdf_url=updated_cert.pdf_url or cert.pdf_url
-                    )
+                    db_cert = to_db_certificate(updated_cert)
+                    db_cert.uuid = updated_cert.uuid or cert.uuid
+                    db_cert.pdf_url = updated_cert.pdf_url or cert.pdf_url
                     await db.add_certificate(db_cert)
                     updated_count += 1
                 
                 # Update progress every 10 items
-                if i % 10 == 0 or i == total:
+                if i % UPDATE_PROGRESS_EVERY_ITEMS == 0 or i == total:
                     try:
                         await progress_msg.edit_text(
                             f"🔄 <b>Янгилаш давом этмоқда...</b>\n\n"
@@ -424,11 +402,11 @@ async def confirm_update(callback: CallbackQuery):
                             f"⏳ Кутинг...",
                             parse_mode=ParseMode.HTML
                         )
-                    except:
+                    except Exception:
                         pass
                 
                 # Small delay
-                await asyncio.sleep(1)
+                await asyncio.sleep(UPDATE_ITEM_DELAY_SECONDS)
         
         # Send completion message
         await progress_msg.edit_text(
@@ -502,7 +480,7 @@ async def confirm_download(callback: CallbackQuery):
         await parser.init_browser(headless=True)
         
         # Create downloads directory
-        os.makedirs("downloads", exist_ok=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         
         downloaded_count = 0
         total = len(filtered_certs)
@@ -510,34 +488,18 @@ async def confirm_download(callback: CallbackQuery):
         for i, cert in enumerate(filtered_certs, 1):
             if cert.uuid:
                 # Download PDF
-                output_path = f"downloads/{cert.uuid}.pdf"
+                output_path = f"{DOWNLOAD_DIR}/{cert.uuid}.pdf"
                 
                 if await parser.download_pdf(cert.uuid, output_path):
                     downloaded_count += 1
-                    
-                    # Send the PDF file
-                    caption = (
-                        f"📄 <b>Сертфикат</b>\n\n"
-                        f"🏢 Ташкилот: {cert.organization_name or 'Номаълум'}\n"
-                        f"📋 Ҳужжат рақами: {cert.document_number or 'Номаълум'}\n"
-                        f"📅 Тақдим этилган сана: {cert.issue_date or 'Номаълум'}\n"
-                        f"🏠 Манзил: {cert.address or 'Номаълум'}\n"
-                        f"🔢 СТИР: {cert.stir or 'Номаълум'}\n"
-                        f"📆 Амал қилиш муддати: {cert.expiry_date or 'Номаълум'}\n"
-                        f"🔖 Фаолият тури: {cert.activity_type or 'Номаълум'}"
-                    )
-                    
+
                     try:
-                        await callback.message.answer_document(
-                            document=FSInputFile(output_path),
-                            caption=caption,
-                            parse_mode=ParseMode.HTML
-                        )
+                        await send_pdf_document(callback.message, output_path, cert)
                     except Exception as e:
                         logger.error(f"Error sending PDF: {e}")
                 
                 # Update progress
-                if i % 5 == 0 or i == total:
+                if i % DOWNLOAD_PROGRESS_EVERY_ITEMS == 0 or i == total:
                     try:
                         await progress_msg.edit_text(
                             f"📄 <b>PDF юклаш давом этмоқда...</b>\n\n"
@@ -546,11 +508,11 @@ async def confirm_download(callback: CallbackQuery):
                             f"⏳ Кутинг...",
                             parse_mode=ParseMode.HTML
                         )
-                    except:
+                    except Exception:
                         pass
                 
                 # Small delay
-                await asyncio.sleep(2)
+                await asyncio.sleep(DOWNLOAD_ITEM_DELAY_SECONDS)
         
         # Send completion message
         await progress_msg.edit_text(
