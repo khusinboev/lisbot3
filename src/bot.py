@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from database import Database, Certificate
-from parser_v3 import LicenseParserV3 as LicenseParser, PageFetchError
+from parser_v4 import LicenseParserV4 as LicenseParser, PageFetchError  # ← v4 Camoufox
 from bot_helpers import send_pdf_document
 from settings import (
     TARGET_ACTIVITY_TYPE,
@@ -76,7 +76,6 @@ def _check_admin(user_id: int) -> bool:
 
 
 async def _send_screenshot(chat_id: int, screenshot_path: str, caption: str = ""):
-    """Screenshot ni userga yuborish."""
     try:
         if os.path.exists(screenshot_path):
             await bot.send_photo(
@@ -224,7 +223,6 @@ async def cb_confirm_scrape(callback: CallbackQuery):
             )
 
         except PageFetchError as e:
-            # API ma'lumot bermadi — screenshot bor
             logger.error(f"PageFetchError: {e}")
             saved_so_far = await db.count_certificates()
 
@@ -242,9 +240,9 @@ async def cb_confirm_scrape(callback: CallbackQuery):
                     chat_id=callback.message.chat.id,
                     screenshot_path=e.screenshot_path,
                     caption=(
-                        f"📸 <b>Xato vaqtidagi ekran</b>\n\n"
-                        f"Cloudflare yoki sayt muammosi bo'lishi mumkin.\n"
-                        f"Bir oz kutib qayta urining."
+                        "📸 <b>Xato vaqtidagi ekran</b>\n\n"
+                        "Cloudflare yoki sayt muammosi bo'lishi mumkin.\n"
+                        "Bir oz kutib qayta urining."
                     ),
                 )
 
@@ -252,9 +250,8 @@ async def cb_confirm_scrape(callback: CallbackQuery):
             logger.error(f"Scraping xato: {e}")
             saved_so_far = await db.count_certificates()
 
-            # Agar driver tirik bo'lsa — screenshot ol
             screenshot_path = None
-            if parser and parser._worker:
+            if parser:
                 try:
                     screenshot_path = await parser.take_screenshot(label="scrape_error")
                 except Exception:
