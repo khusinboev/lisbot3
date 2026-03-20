@@ -11,7 +11,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from database import Database, Certificate
-from parser_v3 import LicenseParserV3 as LicenseParser
+from parser_v3 import LicenseParserV3 as LicenseParser, PageFetchError
 from bot_helpers import send_pdf_document
 from settings import (
     TARGET_ACTIVITY_TYPE,
@@ -73,6 +73,22 @@ def get_confirm_keyboard(action: str) -> InlineKeyboardMarkup:
 
 def _check_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
+
+
+async def _send_screenshot(chat_id: int, screenshot_path: str, caption: str = ""):
+    """Screenshot ni userga yuborish."""
+    try:
+        if os.path.exists(screenshot_path):
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=FSInputFile(screenshot_path),
+                caption=caption or "📸 Xato vaqtidagi ekran holati",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            logger.warning(f"Screenshot fayli topilmadi: {screenshot_path}")
+    except Exception as e:
+        logger.error(f"Screenshot yuborishda xato: {e}")
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -162,27 +178,22 @@ async def cb_confirm_scrape(callback: CallbackQuery):
             parser = LicenseParser()
             await parser.init_browser(headless=True)
 
-            # Kauntlar
             total_saved    = 0
             total_filtered = 0
             current_page   = 0
             total_pages    = 0
 
             async def on_page_done(page: int, total: int, page_certs: list):
-                """Har bir page tugagach: DB ga yoz, progress yangilash."""
                 nonlocal total_saved, total_filtered, current_page, total_pages
                 current_page = page
                 total_pages  = total
 
-                # Shu page dagi sertifikatlarni darrov bazaga kiritamiz
                 for cert in page_certs:
                     await db.upsert_certificate(cert)
                     total_saved += 1
 
-                # Filtered soni
                 total_filtered = await db.count_filtered_certificates()
 
-                # Progress xabarini yangilash (har N sahifada yoki oxirida)
                 if page % SCRAPE_UPDATE_EVERY_PAGES == 0 or page == total:
                     try:
                         await progress_msg.edit_text(
@@ -196,11 +207,8 @@ async def cb_confirm_scrape(callback: CallbackQuery):
                     except Exception:
                         pass
 
-            # scrape_all endi har page uchun callback chaqiradi
-            # callback ichida page_certs bo'lishi uchun parser_v3 ni moslashtirdik
             await parser.scrape_all(on_page_done)
 
-            # Yakuniy statistika
             total_in_db    = await db.count_certificates()
             filtered_in_db = await db.count_filtered_certificates()
 
@@ -215,18 +223,59 @@ async def cb_confirm_scrape(callback: CallbackQuery):
                 reply_markup=get_main_keyboard()
             )
 
-        except Exception as e:
-            logger.error(f"Scraping xato: {e}")
-            # Xato bo'lsa ham saqlangan ma'lumotlar qoladi
+        except PageFetchError as e:
+            # API ma'lumot bermadi — screenshot bor
+            logger.error(f"PageFetchError: {e}")
             saved_so_far = await db.count_certificates()
+
             await progress_msg.edit_text(
-                f"❌ <b>Xatolik yuz berdi!</b>\n\n"
-                f"{html.escape(str(e))[:300]}\n\n"
+                f"❌ <b>Sayt ma'lumot bermadi!</b>\n\n"
+                f"<code>{html.escape(str(e))[:300]}</code>\n\n"
                 f"💾 Xatogacha saqlangan: <b>{saved_so_far}</b> ta\n\n"
-                f"Qayta urinib ko'ring:",
+                f"📸 Ekran holati pastda 👇",
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_main_keyboard()
             )
+
+            if e.screenshot_path:
+                await _send_screenshot(
+                    chat_id=callback.message.chat.id,
+                    screenshot_path=e.screenshot_path,
+                    caption=(
+                        f"📸 <b>Xato vaqtidagi ekran</b>\n\n"
+                        f"Cloudflare yoki sayt muammosi bo'lishi mumkin.\n"
+                        f"Bir oz kutib qayta urining."
+                    ),
+                )
+
+        except Exception as e:
+            logger.error(f"Scraping xato: {e}")
+            saved_so_far = await db.count_certificates()
+
+            # Agar driver tirik bo'lsa — screenshot ol
+            screenshot_path = None
+            if parser and parser._worker:
+                try:
+                    screenshot_path = await parser.take_screenshot(label="scrape_error")
+                except Exception:
+                    pass
+
+            await progress_msg.edit_text(
+                f"❌ <b>Xatolik yuz berdi!</b>\n\n"
+                f"<code>{html.escape(str(e))[:300]}</code>\n\n"
+                f"💾 Xatogacha saqlangan: <b>{saved_so_far}</b> ta\n\n"
+                + ("📸 Ekran holati pastda 👇" if screenshot_path else ""),
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard()
+            )
+
+            if screenshot_path:
+                await _send_screenshot(
+                    chat_id=callback.message.chat.id,
+                    screenshot_path=screenshot_path,
+                    caption="📸 <b>Xato vaqtidagi ekran holati</b>",
+                )
+
         finally:
             if parser:
                 await parser.close()
@@ -310,7 +359,7 @@ async def cb_confirm_download(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Download xato: {e}")
         await progress_msg.edit_text(
-            f"❌ <b>Xatolik!</b>\n\n{html.escape(str(e))[:300]}\n\nQayta urining:",
+            f"❌ <b>Xatolik!</b>\n\n<code>{html.escape(str(e))[:300]}</code>\n\nQayta urining:",
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_keyboard()
         )

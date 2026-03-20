@@ -121,20 +121,21 @@ class _SyncWorker:
         self.driver       = None
         self._warmup_done = False
 
-        # Parser uchun ALOHIDA profil — mavjud Chrome bilan to'qnashmasin.
-        # PARSER_V2_PROFILE_DIR / CHROME_PROFILE_DIR ni ishlatmaymiz:
-        # ular odatda asosiy Chrome profiliga ishora qiladi va
-        # Windows da "Chrome allaqachon ishlamoqda" dialog chiqaradi.
         src_dir = os.path.dirname(os.path.abspath(__file__))
         self._profile_dir = os.path.abspath(
             os.path.join(src_dir, "..", "data", "chrome_profile_parser_v3")
         )
         os.makedirs(self._profile_dir, exist_ok=True)
 
+        # Screenshot papkasi
+        self._screenshot_dir = os.path.abspath(
+            os.path.join(src_dir, "..", "data", "screenshots")
+        )
+        os.makedirs(self._screenshot_dir, exist_ok=True)
+
     # ── Driver ────────────────────────────────────────────────────────────────
 
     def _detect_chrome_binary(self) -> Optional[str]:
-        """Chrome binary path ni aniqlash."""
         import shutil
         env_path = os.getenv("CHROME_BINARY", "").strip()
         if env_path and os.path.isfile(env_path):
@@ -169,18 +170,20 @@ class _SyncWorker:
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1280,900")
+        # Shared memory muammolari uchun
+        options.add_argument("--shm-size=2gb")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--remote-debugging-port=0")
 
         if self.headless:
             options.add_argument("--headless=new")
 
-        # Chrome binary — Linux da aniq ko'rsatish kerak
         chrome_binary = self._detect_chrome_binary()
         if chrome_binary:
             options.binary_location = chrome_binary
         else:
             logger.warning("Chrome binary topilmadi! CHROME_BINARY ni .env ga qo'shing.")
 
-        # Performance log — CDP response body ushlash uchun SHART
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
         version_main = _env_int("CHROME_VERSION_MAIN")
@@ -220,7 +223,25 @@ class _SyncWorker:
             self.driver = self._init_driver()
             self._warmup_done = False
 
-    # ── YouTube warmup (kochirish.py dan aynan) ───────────────────────────────
+    # ── Screenshot ────────────────────────────────────────────────────────────
+
+    def take_screenshot(self, label: str = "debug") -> Optional[str]:
+        """Ekran rasmini oladi va faylga saqlaydi. Path qaytaradi."""
+        if not self._is_alive():
+            logger.warning("Screenshot: driver o'lgan")
+            return None
+        try:
+            ts = int(time.time())
+            filename = f"{label}_{ts}.png"
+            path = os.path.join(self._screenshot_dir, filename)
+            self.driver.save_screenshot(path)
+            logger.info(f"Screenshot saqlandi: {path}")
+            return path
+        except Exception as e:
+            logger.error(f"Screenshot xato: {e}")
+            return None
+
+    # ── YouTube warmup ────────────────────────────────────────────────────────
 
     def _youtube_warmup(self):
         if self._warmup_done or _env_bool("SKIP_WARMUP", default=False):
@@ -249,10 +270,9 @@ class _SyncWorker:
         except Exception as e:
             logger.warning(f"YouTube warmup xato (davom etiladi): {e}")
 
-    # ── Page open (kochirish.py dan aynan) ───────────────────────────────────
+    # ── Page open ─────────────────────────────────────────────────────────────
 
     def _open_page(self, page_0indexed: int) -> bool:
-        """page_0indexed: 0-based. URL da &page= 1-based."""
         url  = REGISTRY_URL.format(page_1indexed=page_0indexed + 1)
         wait = WebDriverWait(self.driver, 60)
         logger.info(f"URL ochilmoqda: {url}")
@@ -269,10 +289,9 @@ class _SyncWorker:
                 _human_delay(3.0, 5.0)
         return False
 
-    # ── CDP response ushlash (kochirish.py dan aynan) ─────────────────────────
+    # ── CDP response ushlash ─────────────────────────────────────────────────
 
     def _get_api_response(self, expected_page_0indexed: int, timeout: int = 40) -> Optional[Dict]:
-        """CDP performance log dan API response body ni olamiz."""
         logger.debug(f"API response kutilmoqda (currentPage={expected_page_0indexed})...")
         deadline = time.time() + timeout
 
@@ -340,12 +359,11 @@ class _SyncWorker:
         logger.warning(f"API response kelmadi (currentPage={expected_page_0indexed}, timeout={timeout}s)")
         return None
 
-    # ── fetch_page (kochirish.py dan aynan) ──────────────────────────────────
+    # ── fetch_page ────────────────────────────────────────────────────────────
 
     def fetch_page(self, page_0indexed: int) -> Optional[Dict]:
         self._ensure_driver()
 
-        # Birinchi chaqiruvda warmup
         current_url = self.driver.current_url
         if "youtube" not in current_url and "license" not in current_url and "about" not in current_url:
             self._youtube_warmup()
@@ -377,7 +395,16 @@ class _SyncWorker:
 
             return raw
 
-        logger.error(f"fetch_page({page_0indexed}): {MAX_RETRIES} urinishdan keyin ham olinmadi")
+        # Barcha urinishlar tugadi — screenshot ol
+        logger.error(f"fetch_page({page_0indexed}): {MAX_RETRIES} urinishdan keyin ham olinmadi. Screenshot olinmoqda...")
+        screenshot_path = self.take_screenshot(label=f"fail_page{page_0indexed}")
+        if screenshot_path:
+            # Screenshot path ni maxsus exception bilan qaytaramiz
+            raise PageFetchError(
+                f"Sahifa {page_0indexed} olinmadi ({MAX_RETRIES} urinish)",
+                screenshot_path=screenshot_path
+            )
+
         return None
 
     # ── Scraping ──────────────────────────────────────────────────────────────
@@ -411,7 +438,6 @@ class _SyncWorker:
         return certs
 
     def fetch_new_since(self, existing_numbers: Set[str], max_pages: int = 50) -> List[Certificate]:
-        """Bazada yo'q yangi sertifikatlarni oladi (kochirish.py dan)."""
         new_certs: List[Certificate] = []
         page = 0
 
@@ -485,6 +511,15 @@ class _SyncWorker:
             return False
 
 
+# ── Custom exception ──────────────────────────────────────────────────────────
+
+class PageFetchError(Exception):
+    """API dan ma'lumot olinmadi + screenshot mavjud."""
+    def __init__(self, message: str, screenshot_path: Optional[str] = None):
+        super().__init__(message)
+        self.screenshot_path = screenshot_path
+
+
 # ── Async wrapper ─────────────────────────────────────────────────────────────
 
 class LicenseParserV3:
@@ -502,7 +537,7 @@ class LicenseParserV3:
         if env is not None:
             headless = env.strip().lower() in {"1", "true", "yes", "y", "on"}
         elif os.name == "nt":
-            headless = False  # Windows: GUI ko'rsatish
+            headless = False
 
         self._worker = _SyncWorker(headless=headless)
         await self._run(self._worker.start)
@@ -513,14 +548,16 @@ class LicenseParserV3:
             self._worker = None
         self._executor.shutdown(wait=False)
 
+    async def take_screenshot(self, label: str = "debug") -> Optional[str]:
+        """Async screenshot — bot.py dan chaqirish uchun."""
+        if not self._worker:
+            return None
+        return await self._run(self._worker.take_screenshot, label)
+
     async def scrape_all(
         self,
         progress_callback: Optional[Callable] = None,
     ) -> List[Certificate]:
-        """
-        progress_callback(page, total_pages, page_certs) shaklida chaqiriladi.
-        bot.py da har page dan keyin darrov DB ga yozish uchun ishlatiladi.
-        """
         all_certs: List[Certificate] = []
         try:
             total_pages = await self._run(self._worker.get_total_pages)
@@ -530,7 +567,6 @@ class LicenseParserV3:
                 all_certs.extend(certs)
 
                 if progress_callback:
-                    # page_certs ni ham uzatamiz — bot.py darrov DB ga yozsin
                     result = progress_callback(page_0 + 1, total_pages, certs)
                     if inspect.isawaitable(result):
                         await result
