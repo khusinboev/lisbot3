@@ -7,9 +7,11 @@ from database import Certificate
 
 def certificate_caption(cert: Certificate) -> str:
     """Telegram xabar uchun sertifikat matni."""
+    NA = "Noma'lum"
+
     # Manzil
     parts = [p for p in [cert.region_uz, cert.sub_region_uz, cert.address] if p]
-    manzil = ", ".join(parts) if parts else "Noma'lum"
+    manzil = ", ".join(parts) if parts else NA
 
     # Faoliyat manzili
     act_addr = ""
@@ -29,29 +31,28 @@ def certificate_caption(cert: Certificate) -> str:
         except Exception:
             specs = cert.specializations
 
-    # Holat emoji
     status_emoji = "✅" if cert.active else "❌"
     status_text = cert.status or ("Faol" if cert.active else "Nofaol")
 
     lines = [
-        f"📄 <b>Sertifikat</b>",
-        f"",
-        f"🏢 <b>Tashkilot:</b> {cert.name or 'Noma\'lum'}",
-        f"🔢 <b>STIR:</b> {cert.tin or 'Noma\'lum'}",
-        f"📋 <b>Hujjat raqami:</b> {cert.number or 'Noma\'lum'}",
+        "📄 <b>Sertifikat</b>",
+        "",
+        f"🏢 <b>Tashkilot:</b> {cert.name or NA}",
+        f"🔢 <b>STIR:</b> {cert.tin or NA}",
+        f"📋 <b>Hujjat raqami:</b> {cert.number or NA}",
         f"🔖 <b>Reg raqam:</b> {cert.register_number or '—'}",
-        f"📅 <b>Taqdim etilgan:</b> {cert.registration_date or 'Noma\'lum'}",
+        f"📅 <b>Taqdim etilgan:</b> {cert.registration_date or NA}",
         f"📆 <b>Muddati:</b> {cert.expiry_date or 'Belgilanmagan'}",
         f"📍 <b>Manzil:</b> {manzil}",
     ]
 
     if act_addr:
-        lines += [f"🏭 <b>Faoliyat manzili:</b>", act_addr]
+        lines += ["🏭 <b>Faoliyat manzili:</b>", act_addr]
 
     if specs:
-        lines += [f"📚 <b>Faoliyat turlari:</b>", specs]
+        lines += ["📚 <b>Faoliyat turlari:</b>", specs]
 
-    lines += [f"{status_emoji} <b>Holat:</b> {status_text}"]
+    lines.append(f"{status_emoji} <b>Holat:</b> {status_text}")
 
     return "\n".join(lines)
 

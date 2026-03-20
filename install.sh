@@ -1,130 +1,149 @@
 #!/bin/bash
-
-# License Bot Installation Script for Ubuntu Server
-# Usage: ./install.sh
+# ──────────────────────────────────────────────────────────────────────────────
+# License Bot — Ubuntu Server O'rnatish Skripti
+# Foydalanish: chmod +x install.sh && ./install.sh
+# ──────────────────────────────────────────────────────────────────────────────
 
 set -e
 
-echo "=========================================="
-echo "License Bot - O'rnatish skripti"
-echo "=========================================="
-
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-# Check if running as root
-if [ "$EUID" -eq 0 ]; then 
-   echo -e "${RED}Xatolik: Root foydalanuvchi sifatida ishga tushirib bo'lmaydi${NC}"
-   exit 1
+info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[OK]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error()   { echo -e "${RED}[XATO]${NC} $1"; exit 1; }
+
+echo ""
+echo "══════════════════════════════════════════════"
+echo "  License Bot — O'rnatish"
+echo "══════════════════════════════════════════════"
+echo ""
+
+# ── 1. Tizim paketlari ────────────────────────────────────────────────────────
+info "Tizim yangilanmoqda..."
+apt-get update -qq
+apt-get install -y -qq \
+    python3 python3-pip python3-venv git wget curl \
+    xvfb \
+    libnss3 libatk-bridge2.0-0 libxcomposite1 libxdamage1 \
+    libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 \
+    libatspi2.0-0 libgtk-3-0 libxss1
+success "Tizim paketlari o'rnatildi"
+
+# ── 2. Google Chrome ──────────────────────────────────────────────────────────
+if ! command -v google-chrome &>/dev/null; then
+    info "Google Chrome o'rnatilmoqda..."
+    wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+    apt-get install -y -qq /tmp/chrome.deb
+    rm /tmp/chrome.deb
+    success "Google Chrome o'rnatildi: $(google-chrome --version)"
+else
+    success "Google Chrome mavjud: $(google-chrome --version)"
 fi
 
-# Get current user
+# ── 3. Loyiha papkasi ─────────────────────────────────────────────────────────
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+info "Loyiha papkasi: $PROJECT_DIR"
+
+mkdir -p "$PROJECT_DIR/data"
+mkdir -p "$PROJECT_DIR/downloads"
+mkdir -p "$PROJECT_DIR/data/chrome_profile_parser_v3"
+
+# ── 4. Virtual muhit ─────────────────────────────────────────────────────────
+info "Python virtual muhit yaratilmoqda..."
+python3 -m venv "$PROJECT_DIR/.venv"
+source "$PROJECT_DIR/.venv/bin/activate"
+pip install --upgrade pip -q
+pip install -r "$PROJECT_DIR/requirements.txt" -q
+success "Python paketlari o'rnatildi"
+
+# ── 5. .env fayl ─────────────────────────────────────────────────────────────
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+    cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
+    warn ".env fayli yaratildi — BOT_TOKEN va ADMIN_IDS ni kiriting:"
+    warn "  nano $PROJECT_DIR/.env"
+else
+    info ".env fayli mavjud"
+fi
+
+# ── 6. Xvfb service ──────────────────────────────────────────────────────────
+info "Xvfb service yaratilmoqda..."
+cat > /etc/systemd/system/xvfb.service << EOF
+[Unit]
+Description=Virtual Frame Buffer X Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'rm -f /tmp/.X99-lock'
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable xvfb
+systemctl start xvfb || warn "Xvfb ishga tushmadi (allaqachon ishlayotgan bo'lishi mumkin)"
+success "Xvfb service sozlandi"
+
+# ── 7. Bot service ────────────────────────────────────────────────────────────
+info "Bot systemd service yaratilmoqda..."
 CURRENT_USER=$(whoami)
-echo -e "${GREEN}Foydalanuvchi: $CURRENT_USER${NC}"
 
-# Update system
-echo -e "${YELLOW}Tizim yangilanmoqda...${NC}"
-sudo apt-get update
-sudo apt-get upgrade -y
+cat > /etc/systemd/system/license-bot.service << EOF
+[Unit]
+Description=License Bot - Telegram Bot for license.gov.uz
+After=network.target xvfb.service
+Wants=xvfb.service
 
-# Install required packages
-echo -e "${YELLOW}Kerakli paketlar o'rnatilmoqda...${NC}"
-sudo apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    git \
-    wget \
-    curl \
-    unzip \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    libpangocairo-1.0-0 \
-    libatspi2.0-0 \
-    libgtk-3-0
+[Service]
+Type=simple
+User=$CURRENT_USER
+WorkingDirectory=$PROJECT_DIR
+Environment=PATH=$PROJECT_DIR/.venv/bin
+Environment=DISPLAY=:99
+EnvironmentFile=$PROJECT_DIR/.env
+ExecStart=$PROJECT_DIR/.venv/bin/python main.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=license-bot
 
-# Create project directory
-PROJECT_DIR="$HOME/license_bot"
-echo -e "${YELLOW}Loyiha katalogi yaratilmoqda: $PROJECT_DIR${NC}"
-mkdir -p "$PROJECT_DIR"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# Copy project files (assuming they are in current directory)
-echo -e "${YELLOW}Loyiha fayllari nusxalanmoqda...${NC}"
-cp -r . "$PROJECT_DIR/" 2>/dev/null || true
+systemctl daemon-reload
+systemctl enable license-bot
+success "Bot service sozlandi"
 
-# Navigate to project directory
-cd "$PROJECT_DIR"
-
-# Create virtual environment
-echo -e "${YELLOW}Virtual muhit yaratilmoqda...${NC}"
-python3 -m venv venv
-
-# Activate virtual environment
-source venv/bin/activate
-
-# Upgrade pip
-echo -e "${YELLOW}pip yangilanmoqda...${NC}"
-pip install --upgrade pip
-
-# Install requirements
-echo -e "${YELLOW}Python paketlari o'rnatilmoqda...${NC}"
-pip install -r requirements.txt
-
-# Install Playwright browsers
-echo -e "${YELLOW}Playwright brauzerlari o'rnatilmoqda...${NC}"
-playwright install chromium
-
-# Create .env file if not exists
-if [ ! -f ".env" ]; then
-    echo -e "${YELLOW}.env fayli yaratilmoqda...${NC}"
-    cp .env.example .env
-    echo -e "${RED}DIQQAT: .env faylini tahrirlang va BOT_TOKEN ni qo'shing!${NC}"
-fi
-
-# Create data directory
-mkdir -p data
-mkdir -p downloads
-
-# Setup systemd service
-echo -e "${YELLOW}Systemd service sozlanmoqda...${NC}"
-sudo cp license-bot.service "/etc/systemd/system/license-bot@$CURRENT_USER.service"
-
-# Replace user in service file
-sudo sed -i "s/%I/$CURRENT_USER/g" "/etc/systemd/system/license-bot@$CURRENT_USER.service"
-sudo sed -i "s|/home/$CURRENT_USER|$HOME|g" "/etc/systemd/system/license-bot@$CURRENT_USER.service"
-
-# Reload systemd
-sudo systemctl daemon-reload
-
-# Enable service
-sudo systemctl "enable license-bot@$CURRENT_USER"
-
+# ── Yakuniy ───────────────────────────────────────────────────────────────────
 echo ""
-echo "=========================================="
-echo -e "${GREEN}O'rnatish yakunlandi!${NC}"
-echo "=========================================="
+echo "══════════════════════════════════════════════"
+echo -e "${GREEN}  O'rnatish yakunlandi!${NC}"
+echo "══════════════════════════════════════════════"
 echo ""
-echo -e "${YELLOW}Keyingi qadamlar:${NC}"
-echo "1. .env faylini tahrirlang:"
-echo "   nano $PROJECT_DIR/.env"
+echo "Keyingi qadamlar:"
 echo ""
-echo "2. BOT_TOKEN va ADMIN_IDS ni qo'shing"
+echo "  1. .env faylini tahrirlang:"
+echo "     nano $PROJECT_DIR/.env"
 echo ""
-echo "3. Botni ishga tushiring:"
-echo "   sudo systemctl start license-bot@$CURRENT_USER"
+echo "  2. BOT_TOKEN va ADMIN_IDS ni kiriting"
 echo ""
-echo "4. Holatini tekshiring:"
-echo "   sudo systemctl status license-bot@$CURRENT_USER"
+echo "  3. Botni ishga tushiring:"
+echo "     systemctl start license-bot"
 echo ""
-echo "5. Loglarni ko'ring:"
-echo "   sudo journalctl -u license-bot@$CURRENT_USER -f"
+echo "  4. Holatni tekshiring:"
+echo "     systemctl status license-bot"
 echo ""
-echo "=========================================="
+echo "  5. Loglarni ko'ring:"
+echo "     journalctl -u license-bot -f"
+echo ""

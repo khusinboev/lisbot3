@@ -1,4 +1,32 @@
-/.env
-/data/
-/.venv/
-.idea
+# Muhit
+.env
+.venv/
+venv/
+
+# Ma'lumotlar
+data/
+downloads/
+
+# Chrome profil
+chrome_profile*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Log fayllar
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
