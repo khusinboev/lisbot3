@@ -133,41 +133,22 @@ class LicenseParserV4:
     # ── Browser lifecycle ─────────────────────────────────────────────────────
 
     async def init_browser(self, headless: bool = True):
-        """
-        Brauzerni ishga tushirish.
-        headless="virtual" → Xvfb avto (Ubuntu server da to'liq mos).
-        CHROME_HEADLESS=false → headless=False (lokal test uchun).
-        """
-        # Env override
-        env_headless = os.getenv("CHROME_HEADLESS")
-        if env_headless is not None:
-            headless = env_headless.strip().lower() in {"1", "true", "yes", "y", "on"}
-        elif os.name == "nt":
-            # Windows da virtual display yo'q — oddiy headful
-            headless = False
-
-        # Camoufox rejimi: True → headless, False → headful, "virtual" → Xvfb
-        if headless and os.name != "nt":
-            cf_headless = "virtual"   # Ubuntu server: Xvfb avto
-        elif headless:
-            cf_headless = True
-        else:
-            cf_headless = False
+        # Linux VPS da har doim virtual, Windows da headful
+        cf_headless = "virtual" if os.name != "nt" else False
 
         logger.info(f"Camoufox ishga tushmoqda (headless={cf_headless!r})...")
 
         self._camoufox = AsyncCamoufox(
-            headless  = cf_headless,
-            geoip     = True,       # IP ga mos geo fingerprint
-            humanize  = True,       # human-like mouse/scroll
-            os        = "windows",  # Windows fingerprint
-            window    = (1280, 900),
+            headless=cf_headless,
+            geoip=True,
+            humanize=True,
+            os="windows",
+            window=(1280, 900),
         )
         self._browser = await self._camoufox.__aenter__()
         self._context = await self._browser.new_context()
-        self._page    = await self._context.new_page()
+        self._page = await self._context.new_page()
 
-        # Response listener — bir marta o'rnatiladi, hamma sahifalar uchun ishlaydi
         self._page.on("response", self._handle_response)
 
         logger.info("Camoufox tayyor ✅")
