@@ -3,6 +3,13 @@ import os
 from pathlib import Path
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 BASE_URL = "https://license.gov.uz"
 API_URL = "https://api.licenses.uz/v2"
 DOC_URL = "https://doc.licenses.uz/v1"
@@ -12,11 +19,30 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 TARGET_ACTIVITY_TYPE = os.getenv("TARGET_ACTIVITY_TYPE", "Олий таълим хизматлари")
 
 SCRAPE_UPDATE_EVERY_PAGES = int(os.getenv("SCRAPE_UPDATE_EVERY_PAGES", "5"))
+SCRAPE_START_PAGE = int(os.getenv("SCRAPE_START_PAGE", "1"))
+SCRAPE_CONTINUE_ON_PAGE_ERROR = _env_bool("SCRAPE_CONTINUE_ON_PAGE_ERROR", True)
+SCRAPE_COOLDOWN_EVERY_PAGES = int(os.getenv("SCRAPE_COOLDOWN_EVERY_PAGES", "10"))
+SCRAPE_COOLDOWN_SECONDS = float(os.getenv("SCRAPE_COOLDOWN_SECONDS", "6"))
 UPDATE_PROGRESS_EVERY_ITEMS = int(os.getenv("UPDATE_PROGRESS_EVERY_ITEMS", "10"))
 DOWNLOAD_PROGRESS_EVERY_ITEMS = int(os.getenv("DOWNLOAD_PROGRESS_EVERY_ITEMS", "5"))
 
 UPDATE_ITEM_DELAY_SECONDS = float(os.getenv("UPDATE_ITEM_DELAY_SECONDS", "0.35"))
 DOWNLOAD_ITEM_DELAY_SECONDS = float(os.getenv("DOWNLOAD_ITEM_DELAY_SECONDS", "0.5"))
+
+AUTO_CHECK_ENABLED = _env_bool("AUTO_CHECK_ENABLED", True)
+AUTO_CHECK_INTERVAL_HOURS = float(os.getenv("AUTO_CHECK_INTERVAL_HOURS", "5"))
+AUTO_CHECK_MAX_PAGES = int(os.getenv("AUTO_CHECK_MAX_PAGES", "60"))
+AUTO_CHECK_NOTIFY_EVERY_ITEMS = int(os.getenv("AUTO_CHECK_NOTIFY_EVERY_ITEMS", "10"))
+
+AUTO_UPDATE_ENABLED = _env_bool("AUTO_UPDATE_ENABLED", True)
+AUTO_UPDATE_TZ = os.getenv("AUTO_UPDATE_TZ", "Asia/Tashkent")
+AUTO_UPDATE_HOUR = int(os.getenv("AUTO_UPDATE_HOUR", "3"))
+AUTO_UPDATE_MINUTE = int(os.getenv("AUTO_UPDATE_MINUTE", "0"))
+AUTO_UPDATE_MAX_PAGES = int(os.getenv("AUTO_UPDATE_MAX_PAGES", "300"))
+AUTO_UPDATE_PROGRESS_EVERY_PAGES = int(os.getenv("AUTO_UPDATE_PROGRESS_EVERY_PAGES", "10"))
+
+AUTO_REQUEST_ITEM_DELAY_SECONDS = float(os.getenv("AUTO_REQUEST_ITEM_DELAY_SECONDS", "1.0"))
+AUTO_NOTIFY_DELAY_SECONDS = float(os.getenv("AUTO_NOTIFY_DELAY_SECONDS", "0.6"))
 
 
 def parse_admin_ids(raw_value: str) -> list[int]:

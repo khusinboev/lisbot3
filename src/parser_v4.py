@@ -102,6 +102,18 @@ def _api_item_to_cert(item: Dict[str, Any]) -> Certificate:
     )
 
 
+def _normalize_number(value: Any) -> str:
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        return str(int(raw))
+    except (TypeError, ValueError):
+        return raw
+
+
 # ── Custom exception ──────────────────────────────────────────────────────────
 
 class PageFetchError(Exception):
@@ -342,30 +354,58 @@ class LicenseParserV4:
     async def scrape_all(
         self,
         progress_callback: Optional[Callable] = None,
+        start_page_1indexed: int = 1,
+        continue_on_page_error: bool = False,
+        error_callback: Optional[Callable] = None,
+        cooldown_every_pages: int = 0,
+        cooldown_seconds: float = 0.0,
     ) -> List[Certificate]:
         """
         Barcha sahifalarni ketma-ket o'qiydi.
         progress_callback(page, total, page_certs) — har sahifadan keyin chaqiriladi.
+        continue_on_page_error=True bo'lsa, muvaffaqiyatsiz sahifalar skip qilinadi.
         """
         all_certs: List[Certificate] = []
 
-        # Birinchi sahifa — totalPages ni bilib olish
-        raw0  = await self.fetch_page(0)
+        start_page_0 = max(0, int(start_page_1indexed) - 1)
+
+        # Boshlang'ich sahifa — totalPages ni bilib olish
+        raw0 = await self.fetch_page(start_page_0)
         inner = raw0.get("data") or {}
         total_pages = max(1, int(inner.get("totalPages") or 1))
 
+        if start_page_0 >= total_pages:
+            logger.warning(
+                f"start_page={start_page_1indexed} total_pages={total_pages} dan katta, skip"
+            )
+            return all_certs
+
         certs0 = self._parse_page(raw0)
         all_certs.extend(certs0)
-        logger.info(f"Sahifa 0: {len(certs0)} ta (jami {total_pages} sahifa)")
+        logger.info(
+            f"Sahifa {start_page_0}: {len(certs0)} ta (jami {total_pages} sahifa, start={start_page_1indexed})"
+        )
 
         if progress_callback:
-            result = progress_callback(1, total_pages, certs0)
+            result = progress_callback(start_page_0 + 1, total_pages, certs0)
             if inspect.isawaitable(result):
                 await result
 
         # Qolgan sahifalar
-        for page_0 in range(1, total_pages):
-            raw   = await self.fetch_page(page_0)
+        for page_0 in range(start_page_0 + 1, total_pages):
+            try:
+                raw = await self.fetch_page(page_0)
+            except PageFetchError as e:
+                if not continue_on_page_error:
+                    raise
+
+                logger.warning(f"Sahifa skip qilindi: page={page_0 + 1}, reason={e}")
+                if error_callback:
+                    result = error_callback(page_0 + 1, total_pages, e)
+                    if inspect.isawaitable(result):
+                        await result
+                continue
+
             certs = self._parse_page(raw)
             all_certs.extend(certs)
 
@@ -378,6 +418,18 @@ class LicenseParserV4:
                     await result
 
             await asyncio.sleep(random.uniform(0.4, 1.0))
+
+            # Saytni haddan ortiq yuklamaslik uchun periodik sovitish pauzasi
+            if (
+                cooldown_every_pages > 0
+                and cooldown_seconds > 0
+                and (page_0 + 1) % cooldown_every_pages == 0
+                and (page_0 + 1) < total_pages
+            ):
+                logger.info(
+                    f"Cooldown: {page_0 + 1}-sahifadan keyin {cooldown_seconds:.1f}s pauza"
+                )
+                await asyncio.sleep(cooldown_seconds)
 
         logger.info(f"scrape_all yakunlandi: jami {len(all_certs)} ta")
         return all_certs
@@ -403,13 +455,7 @@ class LicenseParserV4:
 
             page_has_existing = False
             for item in items:
-                number = item.get("number")
-                if number is None:
-                    continue
-                try:
-                    normalized = str(int(str(number).strip()))
-                except (TypeError, ValueError):
-                    normalized = str(number).strip()
+                normalized = _normalize_number(item.get("number"))
                 if not normalized:
                     continue
 
@@ -432,6 +478,89 @@ class LicenseParserV4:
 
         logger.info(f"fetch_new_since: {len(new_certs)} ta yangi")
         return new_certs
+
+    async def fetch_by_document_numbers(
+        self,
+        target_numbers: Set[str],
+        max_pages: int = 300,
+        progress_callback: Optional[Callable] = None,
+        continue_on_page_error: bool = True,
+        error_callback: Optional[Callable] = None,
+        cooldown_every_pages: int = 0,
+        cooldown_seconds: float = 0.0,
+    ) -> Dict[str, Certificate]:
+        """
+        Hujjat raqamlari bo'yicha sertifikatlarni qayta topadi.
+        Sahifalar ketma-ket ochiladi, topilganlar number->Certificate ko'rinishida qaytadi.
+        """
+        normalized_targets = {_normalize_number(n) for n in target_numbers if _normalize_number(n)}
+        found: Dict[str, Certificate] = {}
+
+        if not normalized_targets:
+            return found
+
+        raw0 = await self.fetch_page(0)
+        total_pages = max(1, int((raw0.get("data") or {}).get("totalPages") or 1))
+        total_pages = min(total_pages, max_pages)
+
+        async def _handle_page(page_0: int, raw: Dict):
+            items = (raw.get("data") or {}).get("certificates") or []
+            for item in items:
+                normalized = _normalize_number(item.get("number"))
+                if normalized and normalized in normalized_targets and normalized not in found:
+                    try:
+                        cert = _api_item_to_cert(item)
+                        if cert.uuid:
+                            found[normalized] = cert
+                    except Exception as e:
+                        logger.warning(f"item parse xato: {e}")
+
+        await _handle_page(0, raw0)
+        if progress_callback:
+            result = progress_callback(1, total_pages, len(found), len(normalized_targets))
+            if inspect.isawaitable(result):
+                await result
+
+        if len(found) >= len(normalized_targets):
+            return found
+
+        for page_0 in range(1, total_pages):
+            try:
+                raw = await self.fetch_page(page_0)
+            except PageFetchError as e:
+                if not continue_on_page_error:
+                    raise
+                logger.warning(f"fetch_by_document_numbers skip page={page_0 + 1}: {e}")
+                if error_callback:
+                    result = error_callback(page_0 + 1, total_pages, e)
+                    if inspect.isawaitable(result):
+                        await result
+                continue
+
+            await _handle_page(page_0, raw)
+            if progress_callback:
+                result = progress_callback(page_0 + 1, total_pages, len(found), len(normalized_targets))
+                if inspect.isawaitable(result):
+                    await result
+
+            if len(found) >= len(normalized_targets):
+                logger.info("Barcha target raqamlar topildi, skan to'xtatildi")
+                break
+
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+
+            if (
+                cooldown_every_pages > 0
+                and cooldown_seconds > 0
+                and (page_0 + 1) % cooldown_every_pages == 0
+                and (page_0 + 1) < total_pages
+            ):
+                await asyncio.sleep(cooldown_seconds)
+
+        logger.info(
+            f"fetch_by_document_numbers yakunlandi: found={len(found)}/{len(normalized_targets)}"
+        )
+        return found
 
     # ── PDF yuklash ───────────────────────────────────────────────────────────
 
