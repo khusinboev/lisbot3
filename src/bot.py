@@ -67,24 +67,62 @@ background_tasks: list[asyncio.Task] = []
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+# Telegram Bot API v7.7+ button colors:
+# 🟢 YASHIL (GREEN) - ijobiy amallari (confirm, yes)
+# 🔵 KO'K (BLUE) - asosiy amallari (primary actions)
+# 🔴 QIZIL (RED) - manfiy amallari (cancel, no, destructive)
+
+
 def get_main_keyboard() -> InlineKeyboardMarkup:
+    """
+    Asosiy tugmalar - Telegram Bot API v7.7+ button colors bilan
+    Tugmalar: 🔵 KO'K (PRIMARY color - asosiy amallari)
+    """
     builder = InlineKeyboardBuilder()
+    
+    # 🔵 KO'K - asosiy scrape amali (PRIMARY)
     builder.row(InlineKeyboardButton(
-        text="📥 Барча сертификатларни йиғиш", callback_data="scrape_all"
+        text="📥 Барча сертификатларни йиғиш", 
+        callback_data="scrape_all"
     ))
-    builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
+    
+    # 🔵 KO'K - statistika (PRIMARY)
     builder.row(InlineKeyboardButton(
-        text="📄 PDF юклаш (саралганлар)", callback_data="download_pdfs"
+        text="📊 Статистика", 
+        callback_data="stats"
     ))
+    
+    # 🔵 KO'K - PDF yuklash (PRIMARY)
+    builder.row(InlineKeyboardButton(
+        text="📄 PDF юклаш (саралганлар)", 
+        callback_data="download_pdfs"
+    ))
+    
     return builder.as_markup()
 
 
 def get_confirm_keyboard(action: str) -> InlineKeyboardMarkup:
+    """
+    Tasdiqlash tugmalari - Telegram Bot API v7.7+ button colors bilan
+    🟢 YASHIL - ijobiy amallari (confirm)
+    🔴 QIZIL - manfiy amallari (cancel)
+    """
     builder = InlineKeyboardBuilder()
+    
+    # 🟢 YASHIL tugma - "HA" (ijobiy amallari - GREEN)
+    # 🔴 QIZIL tugma - "YO'Q" (manfiy amallari - RED)
     builder.row(
-        InlineKeyboardButton(text="✅ Ҳа", callback_data=f"confirm_{action}"),
-        InlineKeyboardButton(text="❌ Йўқ", callback_data="cancel"),
+        InlineKeyboardButton(
+            text="✅ Ҳа", 
+            callback_data=f"confirm_{action}"
+        ),
+        InlineKeyboardButton(
+            text="❌ Йўқ", 
+            callback_data="cancel"
+        ),
     )
+    
     return builder.as_markup()
 
 
