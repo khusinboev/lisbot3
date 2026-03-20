@@ -116,15 +116,20 @@ def _admin_chat_ids() -> list[int]:
 async def _notify_admins(text: str):
     targets = _admin_chat_ids()
     if not targets:
-        logger.warning("ADMIN_IDS bo'sh, admin notification yuborilmadi")
+        logger.debug("ADMIN_IDS bo'sh, admin notification yuborilmadi")
         return
 
     for chat_id in targets:
         try:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+            await asyncio.wait_for(
+                bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                timeout=10.0
+            )
             await asyncio.sleep(AUTO_NOTIFY_DELAY_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(f"Admin notification timeout (chat_id={chat_id})")
         except Exception as e:
-            logger.error(f"Admin notification xato (chat_id={chat_id}): {e}")
+            logger.debug(f"Admin notification xato (chat_id={chat_id}): {e}")
 
 
 async def _send_pdf_to_admins(output_path: str, cert: Certificate):
@@ -135,15 +140,20 @@ async def _send_pdf_to_admins(output_path: str, cert: Certificate):
     caption = certificate_caption(cert)
     for chat_id in targets:
         try:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=FSInputFile(output_path),
-                caption=caption,
-                parse_mode=ParseMode.HTML,
+            await asyncio.wait_for(
+                bot.send_document(
+                    chat_id=chat_id,
+                    document=FSInputFile(output_path),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                ),
+                timeout=20.0
             )
             await asyncio.sleep(AUTO_NOTIFY_DELAY_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(f"Admin PDF timeout (chat_id={chat_id}, uuid={cert.uuid})")
         except Exception as e:
-            logger.error(f"Admin PDF yuborish xato (chat_id={chat_id}, uuid={cert.uuid}): {e}")
+            logger.debug(f"Admin PDF xato (chat_id={chat_id}, uuid={cert.uuid}): {e}")
 
 
 def _resolve_timezone(tz_name: str):
@@ -349,10 +359,13 @@ async def _run_auto_update_once():
 
 async def _auto_check_worker():
     interval_seconds = max(300.0, AUTO_CHECK_INTERVAL_HOURS * 3600.0)
-    await _notify_admins(
-        f"⏱️ <b>Auto-check worker yoqildi</b>\n"
-        f"Har <b>{AUTO_CHECK_INTERVAL_HOURS:g}</b> soatda ishlaydi."
-    )
+    if _admin_chat_ids():
+        await _notify_admins(
+            f"⏱️ <b>Auto-check worker yoqildi</b>\n"
+            f"Har <b>{AUTO_CHECK_INTERVAL_HOURS:g}</b> soatda ishlaydi."
+        )
+    else:
+        logger.info(f"Auto-check worker yoqildi (ADMIN_IDS bo'sh, notification yubormaydi)")
     await asyncio.sleep(30)
     while True:
         await _run_auto_check_once()
@@ -360,10 +373,13 @@ async def _auto_check_worker():
 
 
 async def _auto_update_worker():
-    await _notify_admins(
-        f"🕒 <b>Auto-update worker yoqildi</b>\n"
-        f"Har kuni <b>{AUTO_UPDATE_HOUR:02d}:{AUTO_UPDATE_MINUTE:02d}</b> ({AUTO_UPDATE_TZ})."
-    )
+    if _admin_chat_ids():
+        await _notify_admins(
+            f"🕒 <b>Auto-update worker yoqildi</b>\n"
+            f"Har kuni <b>{AUTO_UPDATE_HOUR:02d}:{AUTO_UPDATE_MINUTE:02d}</b> ({AUTO_UPDATE_TZ})."
+        )
+    else:
+        logger.info(f"Auto-update worker yoqildi (ADMIN_IDS bo'sh, notification yubormaydi)")
     await asyncio.sleep(30)
     while True:
         wait_s = _seconds_until_next_daily_run(AUTO_UPDATE_TZ, AUTO_UPDATE_HOUR, AUTO_UPDATE_MINUTE)
@@ -410,23 +426,32 @@ async def cmd_stats(message: Message):
 
 @dp.callback_query(F.data == "stats")
 async def cb_stats(callback: CallbackQuery):
-    await callback.answer()
-    stats = await db.get_stats_by_activity(TARGET_ACTIVITY_TYPE)
-    await callback.message.edit_text(
-        f"📊 <b>Statistika</b>\n\n"
-        f"Jami: <b>{stats['total_certificates']}</b>\n"
-        f"Saralgan («{TARGET_ACTIVITY_TYPE}»): <b>{stats['filtered_certificates']}</b>\n"
-        f"Faol (jami): <b>{stats['active_certificates']}</b>\n"
-        f"Faol (saralgan): <b>{stats['active_filtered_certificates']}</b>\n\n"
-        f"Amalni tanlang:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_main_keyboard()
-    )
+    try:
+        await asyncio.wait_for(callback.answer(), timeout=5.0)
+    except Exception as e:
+        logger.debug(f"Callback answer xato: {e}")
+    try:
+        stats = await db.get_stats_by_activity(TARGET_ACTIVITY_TYPE)
+        await callback.message.edit_text(
+            f"📊 <b>Statistika</b>\n\n"
+            f"Jami: <b>{stats['total_certificates']}</b>\n"
+            f"Saralgan («{TARGET_ACTIVITY_TYPE}»): <b>{stats['filtered_certificates']}</b>\n"
+            f"Faol (jami): <b>{stats['active_certificates']}</b>\n"
+            f"Faol (saralgan): <b>{stats['active_filtered_certificates']}</b>\n\n"
+            f"Amalni tanlang:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Stats callback xato: {e}")
 
 
 @dp.callback_query(F.data == "scrape_all")
 async def cb_scrape(callback: CallbackQuery):
-    await callback.answer()
+    try:
+        await asyncio.wait_for(callback.answer(), timeout=5.0)
+    except Exception as e:
+        logger.debug(f"Callback answer xato: {e}")
     if scrape_lock.locked():
         await callback.message.answer("⚠️ Jarayon davom etmoqda, kuting...")
         return
@@ -443,7 +468,10 @@ async def cb_scrape(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "confirm_scrape")
 async def cb_confirm_scrape(callback: CallbackQuery):
-    await callback.answer()
+    try:
+        await asyncio.wait_for(callback.answer(), timeout=5.0)
+    except Exception as e:
+        logger.debug(f"Callback answer xato: {e}")
     global parser
 
     progress_msg = await callback.message.edit_text(
@@ -586,7 +614,10 @@ async def cb_confirm_scrape(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "download_pdfs")
 async def cb_download(callback: CallbackQuery):
-    await callback.answer()
+    try:
+        await asyncio.wait_for(callback.answer(), timeout=5.0)
+    except Exception as e:
+        logger.debug(f"Callback answer xato: {e}")
     count = await db.count_filtered_certificates()
     await callback.message.edit_text(
         f"📄 <b>PDF yuklash</b>\n\n"
@@ -599,7 +630,10 @@ async def cb_download(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "confirm_download")
 async def cb_confirm_download(callback: CallbackQuery):
-    await callback.answer()
+    try:
+        await asyncio.wait_for(callback.answer(), timeout=5.0)
+    except Exception as e:
+        logger.debug(f"Callback answer xato: {e}")
     global parser
 
     progress_msg = await callback.message.edit_text(
@@ -689,7 +723,10 @@ async def cb_confirm_download(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "cancel")
 async def cb_cancel(callback: CallbackQuery):
-    await callback.answer("Bekor qilindi")
+    try:
+        await asyncio.wait_for(callback.answer("Bekor qilindi"), timeout=5.0)
+    except Exception as e:
+        logger.debug(f"Callback answer xato: {e}")
     await callback.message.edit_text(
         "❌ Bekor qilindi.\n\nAmalni tanlang:",
         parse_mode=ParseMode.HTML,
