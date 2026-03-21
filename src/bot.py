@@ -533,7 +533,8 @@ async def cmd_start(message: Message):
 async def cmd_stats(message: Message):
     if not _check_admin(message.from_user.id):
         return
-    stats = await db.rebuild_filtered_by_activity(TARGET_ACTIVITY_TYPE)
+    await db.sync_filtered_by_activity(TARGET_ACTIVITY_TYPE)
+    stats = await db.get_stats_by_activity(TARGET_ACTIVITY_TYPE)
     await message.answer(
         f"📊 <b>Statistika</b>\n\n"
         f"Jami: <b>{stats['total_certificates']}</b>\n"
@@ -552,7 +553,8 @@ async def cb_stats(callback: CallbackQuery):
     except Exception as e:
         logger.debug(f"Callback answer xato: {e}")
     try:
-        stats = await db.rebuild_filtered_by_activity(TARGET_ACTIVITY_TYPE)
+        await db.sync_filtered_by_activity(TARGET_ACTIVITY_TYPE)
+        stats = await db.get_stats_by_activity(TARGET_ACTIVITY_TYPE)
         await callback.message.edit_text(
             f"📊 <b>Statistika</b>\n\n"
             f"Jami: <b>{stats['total_certificates']}</b>\n"

@@ -2,7 +2,6 @@
 src/database.py — API response ga mos yangilangan schema.
 """
 import aiosqlite
-import json
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
@@ -358,104 +357,56 @@ class Database:
                 "active_filtered_certificates": (filtered_row[1] if filtered_row else 0) or 0,
             }
 
-    async def rebuild_filtered_by_activity(self, activity_type: str) -> Dict[str, int]:
+    async def sync_filtered_by_activity(self, activity_type: str) -> int:
         """
-        Saralashni to'liq qayta hisoblab, ikkala jadvalni bir tranzaksiyada sinxronlaydi.
+        certificates jadvalidagi activity_type ga mos yozuvlarni
+        filtered_certificates jadvaliga to'liq sinxronlaydi.
         """
-        target = (activity_type or "").strip().casefold()
-
-        def _extract_texts(raw: Optional[str]) -> List[str]:
-            if not raw:
-                return []
-            val = str(raw).strip()
-            if not val:
-                return []
-            try:
-                parsed = json.loads(val)
-                if isinstance(parsed, list):
-                    return [str(x).strip() for x in parsed if str(x).strip()]
-                if isinstance(parsed, str):
-                    parsed_s = parsed.strip()
-                    return [parsed_s] if parsed_s else []
-            except Exception:
-                pass
-            return [val]
-
+        pattern = f"%{(activity_type or '').lower()}%"
+        now = datetime.now().isoformat()
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("BEGIN")
-            try:
-                await db.execute("UPDATE certificates SET is_filtered=0")
+            await db.execute("DELETE FROM filtered_certificates")
 
-                matched_uuids: List[str] = []
-                if target:
-                    db.row_factory = aiosqlite.Row
-                    cur = await db.execute(
-                        "SELECT uuid, specializations FROM certificates WHERE uuid IS NOT NULL"
-                    )
-                    rows = await cur.fetchall()
-
-                    for row in rows:
-                        uuid = str(row["uuid"] or "").strip()
-                        if not uuid:
-                            continue
-
-                        specs = _extract_texts(row["specializations"])
-                        if any(target in s.casefold() for s in specs):
-                            matched_uuids.append(uuid)
-
-                if matched_uuids:
-                    chunk_size = 500
-                    for i in range(0, len(matched_uuids), chunk_size):
-                        chunk = matched_uuids[i:i + chunk_size]
-                        placeholders = ",".join("?" for _ in chunk)
-                        await db.execute(
-                            f"UPDATE certificates SET is_filtered=1 WHERE uuid IN ({placeholders})",
-                            chunk,
-                        )
-
-                await db.execute("DELETE FROM filtered_certificates")
-                await db.execute(
-                    """
-                    INSERT INTO filtered_certificates (
-                        uuid, register_id, application_id, document_id,
-                        number, register_number, name, tin, pin,
-                        region_uz, sub_region_uz, address, activity_addresses,
-                        registration_date, expiry_date, revoke_date,
-                        status, active, specializations, specialization_ids,
-                        is_filtered, created_at, updated_at
-                    )
-                    SELECT
-                        uuid, register_id, application_id, document_id,
-                        number, register_number, name, tin, pin,
-                        region_uz, sub_region_uz, address, activity_addresses,
-                        registration_date, expiry_date, revoke_date,
-                        status, active, specializations, specialization_ids,
-                        1, created_at, ?
-                    FROM certificates
-                    WHERE is_filtered=1
-                    """,
-                    (datetime.now().isoformat(),),
+            await db.execute(
+                """
+                INSERT INTO filtered_certificates (
+                    uuid, register_id, application_id, document_id,
+                    number, register_number, name, tin, pin,
+                    region_uz, sub_region_uz, address, activity_addresses,
+                    registration_date, expiry_date, revoke_date,
+                    status, active, specializations, specialization_ids,
+                    is_filtered, created_at, updated_at
                 )
+                SELECT
+                    uuid, register_id, application_id, document_id,
+                    number, register_number, name, tin, pin,
+                    region_uz, sub_region_uz, address, activity_addresses,
+                    registration_date, expiry_date, revoke_date,
+                    status, active, specializations, specialization_ids,
+                    1, COALESCE(created_at, ?), ?
+                FROM certificates
+                WHERE LOWER(COALESCE(specializations, '')) LIKE ?
+                  AND uuid IS NOT NULL
+                """,
+                (now, now, pattern),
+            )
 
-                cur = await db.execute("SELECT COUNT(*) FROM certificates")
-                total = (await cur.fetchone())[0] or 0
-                cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE is_filtered=1")
-                filtered = (await cur.fetchone())[0] or 0
-                cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE active=1")
-                active_total = (await cur.fetchone())[0] or 0
-                cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE active=1 AND is_filtered=1")
-                active_filtered = (await cur.fetchone())[0] or 0
+            await db.execute(
+                """
+                UPDATE certificates
+                SET is_filtered = CASE
+                    WHEN LOWER(COALESCE(specializations, '')) LIKE ? THEN 1
+                    ELSE 0
+                END,
+                updated_at = ?
+                """,
+                (pattern, now),
+            )
 
-                await db.commit()
-                return {
-                    "total_certificates": total,
-                    "filtered_certificates": filtered,
-                    "active_certificates": active_total,
-                    "active_filtered_certificates": active_filtered,
-                }
-            except Exception:
-                await db.rollback()
-                raise
+            await db.commit()
+
+            cur = await db.execute("SELECT COUNT(*) FROM filtered_certificates")
+            return (await cur.fetchone())[0] or 0
 
     async def update_stats(self, **kwargs):
         pass  # get_stats() real hisoblaydi, bu kerak emas
