@@ -2,6 +2,7 @@
 src/database.py — API response ga mos yangilangan schema.
 """
 import aiosqlite
+import json
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
@@ -361,19 +362,56 @@ class Database:
         """
         Saralashni to'liq qayta hisoblab, ikkala jadvalni bir tranzaksiyada sinxronlaydi.
         """
-        pattern = f"%{(activity_type or '').lower()}%"
+        target = (activity_type or "").strip().casefold()
+
+        def _extract_texts(raw: Optional[str]) -> List[str]:
+            if not raw:
+                return []
+            val = str(raw).strip()
+            if not val:
+                return []
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x).strip()]
+                if isinstance(parsed, str):
+                    parsed_s = parsed.strip()
+                    return [parsed_s] if parsed_s else []
+            except Exception:
+                pass
+            return [val]
+
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN")
             try:
                 await db.execute("UPDATE certificates SET is_filtered=0")
-                await db.execute(
-                    """
-                    UPDATE certificates
-                    SET is_filtered=1
-                    WHERE LOWER(COALESCE(specializations, '')) LIKE ?
-                    """,
-                    (pattern,),
-                )
+
+                matched_uuids: List[str] = []
+                if target:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT uuid, specializations FROM certificates WHERE uuid IS NOT NULL"
+                    )
+                    rows = await cur.fetchall()
+
+                    for row in rows:
+                        uuid = str(row["uuid"] or "").strip()
+                        if not uuid:
+                            continue
+
+                        specs = _extract_texts(row["specializations"])
+                        if any(target in s.casefold() for s in specs):
+                            matched_uuids.append(uuid)
+
+                if matched_uuids:
+                    chunk_size = 500
+                    for i in range(0, len(matched_uuids), chunk_size):
+                        chunk = matched_uuids[i:i + chunk_size]
+                        placeholders = ",".join("?" for _ in chunk)
+                        await db.execute(
+                            f"UPDATE certificates SET is_filtered=1 WHERE uuid IN ({placeholders})",
+                            chunk,
+                        )
 
                 await db.execute("DELETE FROM filtered_certificates")
                 await db.execute(
@@ -394,9 +432,9 @@ class Database:
                         status, active, specializations, specialization_ids,
                         1, created_at, ?
                     FROM certificates
-                    WHERE LOWER(COALESCE(specializations, '')) LIKE ?
+                    WHERE is_filtered=1
                     """,
-                    (datetime.now().isoformat(), pattern),
+                    (datetime.now().isoformat(),),
                 )
 
                 cur = await db.execute("SELECT COUNT(*) FROM certificates")
