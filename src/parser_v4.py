@@ -20,6 +20,8 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import inspect
 from urllib.parse import quote_plus
 
+import aiohttp
+
 from loguru import logger
 
 try:
@@ -620,12 +622,28 @@ class LicenseParserV4:
 
     async def download_pdf(self, uuid: str, output_path: str) -> bool:
         """
-        PDF ni brauzer orqali fetch qilib saqlaydi.
-        Brauzer sessiyasi va cookielari ishlatiladi — Cloudflare bypass avtomatik.
+        PDF ni avval oddiy HTTP request bilan yuklab ko'radi.
+        Agar muvaffaqiyatsiz bo'lsa, brauzer fetch fallback ishlatiladi.
         """
         try:
             pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz&download"
 
+            # 1) Request-first usul
+            try:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(pdf_url) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            if content and content[:4] == b"%PDF":
+                                Path(output_path).write_bytes(content)
+                                logger.info(f"PDF saqlandi (http): {output_path}")
+                                return True
+                        logger.debug(f"HTTP orqali PDF yuklanmadi: status={resp.status}, uuid={uuid}")
+            except Exception as e:
+                logger.debug(f"HTTP orqali PDF xato (fallback bo'ladi), uuid={uuid}: {e}")
+
+            # 2) Fallback: brauzer fetch
             content_b64: Optional[str] = await self._page.evaluate("""
                 async (url) => {
                     try {

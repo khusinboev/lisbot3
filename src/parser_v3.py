@@ -12,6 +12,7 @@ import time
 import random
 import json
 import base64
+import urllib.request
 from typing import List, Optional, Callable, Dict, Any, Set
 from concurrent.futures import ThreadPoolExecutor
 import inspect
@@ -487,6 +488,28 @@ class _SyncWorker:
     def download_pdf(self, uuid: str, output_path: str) -> bool:
         try:
             pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz&download"
+
+            # 1) Request-first usul
+            try:
+                req = urllib.request.Request(
+                    pdf_url,
+                    method="GET",
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/pdf,*/*",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    content_http = resp.read()
+                if content_http and content_http[:4] == b"%PDF":
+                    with open(output_path, 'wb') as f:
+                        f.write(content_http)
+                    logger.info(f"PDF saqlandi (http): {output_path}")
+                    return True
+            except Exception as e:
+                logger.debug(f"HTTP orqali PDF xato (fallback bo'ladi), uuid={uuid}: {e}")
+
+            # 2) Fallback: brauzer fetch
             content = self.driver.execute_async_script("""
                 const done = arguments[arguments.length - 1];
                 fetch(arguments[0])
