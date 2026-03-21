@@ -357,6 +357,68 @@ class Database:
                 "active_filtered_certificates": (filtered_row[1] if filtered_row else 0) or 0,
             }
 
+    async def rebuild_filtered_by_activity(self, activity_type: str) -> Dict[str, int]:
+        """
+        Saralashni to'liq qayta hisoblab, ikkala jadvalni bir tranzaksiyada sinxronlaydi.
+        """
+        pattern = f"%{(activity_type or '').lower()}%"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN")
+            try:
+                await db.execute("UPDATE certificates SET is_filtered=0")
+                await db.execute(
+                    """
+                    UPDATE certificates
+                    SET is_filtered=1
+                    WHERE LOWER(COALESCE(specializations, '')) LIKE ?
+                    """,
+                    (pattern,),
+                )
+
+                await db.execute("DELETE FROM filtered_certificates")
+                await db.execute(
+                    """
+                    INSERT INTO filtered_certificates (
+                        uuid, register_id, application_id, document_id,
+                        number, register_number, name, tin, pin,
+                        region_uz, sub_region_uz, address, activity_addresses,
+                        registration_date, expiry_date, revoke_date,
+                        status, active, specializations, specialization_ids,
+                        is_filtered, created_at, updated_at
+                    )
+                    SELECT
+                        uuid, register_id, application_id, document_id,
+                        number, register_number, name, tin, pin,
+                        region_uz, sub_region_uz, address, activity_addresses,
+                        registration_date, expiry_date, revoke_date,
+                        status, active, specializations, specialization_ids,
+                        1, created_at, ?
+                    FROM certificates
+                    WHERE LOWER(COALESCE(specializations, '')) LIKE ?
+                    """,
+                    (datetime.now().isoformat(), pattern),
+                )
+
+                cur = await db.execute("SELECT COUNT(*) FROM certificates")
+                total = (await cur.fetchone())[0] or 0
+                cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE is_filtered=1")
+                filtered = (await cur.fetchone())[0] or 0
+                cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE active=1")
+                active_total = (await cur.fetchone())[0] or 0
+                cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE active=1 AND is_filtered=1")
+                active_filtered = (await cur.fetchone())[0] or 0
+
+                await db.commit()
+                return {
+                    "total_certificates": total,
+                    "filtered_certificates": filtered,
+                    "active_certificates": active_total,
+                    "active_filtered_certificates": active_filtered,
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
     async def update_stats(self, **kwargs):
         pass  # get_stats() real hisoblaydi, bu kerak emas
 
