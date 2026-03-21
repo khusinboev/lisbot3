@@ -624,7 +624,7 @@ class LicenseParserV4:
         Brauzer sessiyasi va cookielari ishlatiladi — Cloudflare bypass avtomatik.
         """
         try:
-            pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz"
+            pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz&download"
 
             content_b64: Optional[str] = await self._page.evaluate("""
                 async (url) => {

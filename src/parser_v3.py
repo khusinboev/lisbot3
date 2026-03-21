@@ -486,7 +486,7 @@ class _SyncWorker:
 
     def download_pdf(self, uuid: str, output_path: str) -> bool:
         try:
-            pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz"
+            pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz&download"
             content = self.driver.execute_async_script("""
                 const done = arguments[arguments.length - 1];
                 fetch(arguments[0])
