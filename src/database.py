@@ -2,11 +2,69 @@
 src/database.py — API response ga mos yangilangan schema.
 """
 import aiosqlite
+import json
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from pathlib import Path
 from settings import DB_PATH
+
+
+_CYR_TO_LAT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "j", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "x", "ц": "s", "ч": "ch", "ш": "sh", "щ": "sh", "ъ": "",
+    "ы": "i", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "қ": "q", "ғ": "g", "ў": "o", "ҳ": "h",
+})
+
+
+def _normalize_activity_text(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    value = str(text).strip().lower()
+    if not value:
+        return ""
+
+    # Apostrofning turli unicode variantlarini bir xil ko'rinishga keltiramiz.
+    for ch in ("’", "`", "ʻ", "ʼ", "ʹ", "´", "‘"):
+        value = value.replace(ch, "'")
+
+    value = value.translate(_CYR_TO_LAT)
+
+    # Apostrof va bo'shliqlardan mustaqil qidiruv.
+    cleaned = []
+    for ch in value:
+        if ch.isalnum():
+            cleaned.append(ch)
+    return "".join(cleaned)
+
+
+def _specializations_list(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed if v is not None]
+        return [str(parsed)]
+    except Exception:
+        return [str(raw)]
+
+
+def _activity_matches(activity_type: str, specializations_raw: Optional[str]) -> bool:
+    target = _normalize_activity_text(activity_type)
+    if not target:
+        return False
+
+    for specialization in _specializations_list(specializations_raw):
+        norm_spec = _normalize_activity_text(specialization)
+        if not norm_spec:
+            continue
+        if target in norm_spec or norm_spec in target:
+            return True
+    return False
 
 
 @dataclass
@@ -331,30 +389,27 @@ class Database:
         """
         certificates jadvalidan faoliyat turi bo'yicha dinamik statistika.
         """
-        pattern = f"%{(activity_type or '').lower()}%"
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT COUNT(*) FROM certificates")
-            total = (await cur.fetchone())[0] or 0
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT specializations, active FROM certificates")
+            rows = await cur.fetchall()
 
-            cur = await db.execute(
-                """
-                SELECT COUNT(*),
-                       SUM(CASE WHEN active=1 THEN 1 ELSE 0 END)
-                FROM certificates
-                WHERE LOWER(COALESCE(specializations, '')) LIKE ?
-                """,
-                (pattern,),
-            )
-            filtered_row = await cur.fetchone()
+            total = len(rows)
+            active_total = sum(1 for r in rows if int(r["active"] or 0) == 1)
 
-            cur = await db.execute("SELECT COUNT(*) FROM certificates WHERE active=1")
-            active_total = (await cur.fetchone())[0] or 0
+            filtered_count = 0
+            active_filtered = 0
+            for row in rows:
+                if _activity_matches(activity_type, row["specializations"]):
+                    filtered_count += 1
+                    if int(row["active"] or 0) == 1:
+                        active_filtered += 1
 
             return {
                 "total_certificates": total,
-                "filtered_certificates": (filtered_row[0] if filtered_row else 0) or 0,
+                "filtered_certificates": filtered_count,
                 "active_certificates": active_total,
-                "active_filtered_certificates": (filtered_row[1] if filtered_row else 0) or 0,
+                "active_filtered_certificates": active_filtered,
             }
 
     async def sync_filtered_by_activity(self, activity_type: str) -> int:
@@ -362,46 +417,63 @@ class Database:
         certificates jadvalidagi activity_type ga mos yozuvlarni
         filtered_certificates jadvaliga to'liq sinxronlaydi.
         """
-        pattern = f"%{(activity_type or '').lower()}%"
         now = datetime.now().isoformat()
         async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM certificates")
+            all_rows = await cur.fetchall()
+
+            matched_rows = [r for r in all_rows if _activity_matches(activity_type, r["specializations"])]
+
             await db.execute("DELETE FROM filtered_certificates")
 
-            await db.execute(
-                """
-                INSERT INTO filtered_certificates (
-                    uuid, register_id, application_id, document_id,
-                    number, register_number, name, tin, pin,
-                    region_uz, sub_region_uz, address, activity_addresses,
-                    registration_date, expiry_date, revoke_date,
-                    status, active, specializations, specialization_ids,
-                    is_filtered, created_at, updated_at
+            if matched_rows:
+                await db.executemany(
+                    """
+                    INSERT INTO filtered_certificates (
+                        uuid, register_id, application_id, document_id,
+                        number, register_number, name, tin, pin,
+                        region_uz, sub_region_uz, address, activity_addresses,
+                        registration_date, expiry_date, revoke_date,
+                        status, active, specializations, specialization_ids,
+                        is_filtered, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?,
+                        ?, ?, ?,
+                        ?, ?, ?, ?,
+                        1, ?, ?
+                    )
+                    """,
+                    [
+                        (
+                            row["uuid"], row["register_id"], row["application_id"], row["document_id"],
+                            row["number"], row["register_number"], row["name"], row["tin"], row["pin"],
+                            row["region_uz"], row["sub_region_uz"], row["address"], row["activity_addresses"],
+                            row["registration_date"], row["expiry_date"], row["revoke_date"],
+                            row["status"], row["active"], row["specializations"], row["specialization_ids"],
+                            row["created_at"] or now, now,
+                        )
+                        for row in matched_rows
+                        if row["uuid"]
+                    ],
                 )
-                SELECT
-                    uuid, register_id, application_id, document_id,
-                    number, register_number, name, tin, pin,
-                    region_uz, sub_region_uz, address, activity_addresses,
-                    registration_date, expiry_date, revoke_date,
-                    status, active, specializations, specialization_ids,
-                    1, COALESCE(created_at, ?), ?
-                FROM certificates
-                WHERE LOWER(COALESCE(specializations, '')) LIKE ?
-                  AND uuid IS NOT NULL
-                """,
-                (now, now, pattern),
-            )
 
             await db.execute(
                 """
                 UPDATE certificates
-                SET is_filtered = CASE
-                    WHEN LOWER(COALESCE(specializations, '')) LIKE ? THEN 1
-                    ELSE 0
-                END,
-                updated_at = ?
+                SET is_filtered = 0,
+                    updated_at = ?
                 """,
-                (pattern, now),
+                (now,),
             )
+
+            if matched_rows:
+                await db.executemany(
+                    "UPDATE certificates SET is_filtered = 1, updated_at = ? WHERE uuid = ?",
+                    [(now, row["uuid"]) for row in matched_rows if row["uuid"]],
+                )
 
             await db.commit()
 

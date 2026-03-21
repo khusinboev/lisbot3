@@ -77,7 +77,7 @@ def _api_item_to_cert(item: Dict[str, Any]) -> Certificate:
     ]
 
     status_str  = (item.get("status") or {}).get("status", "")
-    is_filtered = any(TARGET_ACTIVITY_TYPE.lower() in s.lower() for s in spec_names)
+    is_filtered = any(_activity_text_matches(TARGET_ACTIVITY_TYPE, s) for s in spec_names)
 
     return Certificate(
         uuid               = item.get("uuid"),
@@ -114,6 +114,36 @@ def _normalize_number(value: Any) -> str:
         return str(int(raw))
     except (TypeError, ValueError):
         return raw
+
+
+_CYR_TO_LAT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "j", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "x", "ц": "s", "ч": "ch", "ш": "sh", "щ": "sh", "ъ": "",
+    "ы": "i", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "қ": "q", "ғ": "g", "ў": "o", "ҳ": "h",
+})
+
+
+def _normalize_activity_text(text: Any) -> str:
+    value = str(text or "").strip().lower()
+    if not value:
+        return ""
+
+    for ch in ("’", "`", "ʻ", "ʼ", "ʹ", "´", "‘"):
+        value = value.replace(ch, "'")
+
+    value = value.translate(_CYR_TO_LAT)
+    return "".join(ch for ch in value if ch.isalnum())
+
+
+def _activity_text_matches(target: str, candidate: str) -> bool:
+    t = _normalize_activity_text(target)
+    c = _normalize_activity_text(candidate)
+    if not t or not c:
+        return False
+    return t in c or c in t
 
 
 # ── Custom exception ──────────────────────────────────────────────────────────
