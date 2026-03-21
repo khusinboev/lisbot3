@@ -242,6 +242,7 @@ async def _send_pdf_to_admins(output_path: str, cert: Certificate):
         return
 
     caption = certificate_caption(cert)
+    sent_any = False
     for chat_id in targets:
         try:
             await asyncio.wait_for(
@@ -253,11 +254,18 @@ async def _send_pdf_to_admins(output_path: str, cert: Certificate):
                 ),
                 timeout=20.0
             )
+            sent_any = True
             await asyncio.sleep(AUTO_NOTIFY_DELAY_SECONDS)
         except asyncio.TimeoutError:
             logger.warning(f"Admin PDF timeout (chat_id={chat_id}, uuid={cert.uuid})")
         except Exception as e:
             logger.debug(f"Admin PDF xato (chat_id={chat_id}, uuid={cert.uuid}): {e}")
+
+    if sent_any and os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except Exception as e:
+            logger.debug(f"PDF o'chirish xato (path={output_path}): {e}")
 
 
 def _resolve_timezone(tz_name: str):
@@ -309,10 +317,9 @@ async def _run_auto_check_once():
 
         inserted = 0
         filtered = 0
-        pdf_ready = 0
         pdf_sent = 0
         failed = 0
-        pdf_queue: list[tuple[str, Certificate]] = []
+        pdf_downloaded = 0
 
         total = len(new_certs)
         for idx, cert in enumerate(new_certs, 1):
@@ -324,8 +331,9 @@ async def _run_auto_check_once():
                     filtered += 1
                     output_path = os.path.join(DOWNLOAD_DIR, f"auto_{cert.uuid}.pdf")
                     if await parser_local.download_pdf(cert.uuid, output_path):
-                        pdf_queue.append((output_path, cert))
-                        pdf_ready += 1
+                        pdf_downloaded += 1
+                        await _send_pdf_to_admins(output_path, cert)
+                        pdf_sent += 1
             except Exception as e:
                 failed += 1
                 logger.error(f"Auto-check item xato (uuid={cert.uuid}): {e}")
@@ -336,7 +344,8 @@ async def _run_auto_check_once():
                     f"{idx}/{total}\n"
                     f"💾 Bazaga: <b>{inserted}</b>\n"
                     f"🎯 Filterga mos: <b>{filtered}</b>\n"
-                    f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
+                    f"📄 PDF yuklandi: <b>{pdf_downloaded}</b>\n"
+                    f"📨 PDF yuborildi: <b>{pdf_sent}</b>\n"
                     f"⚠️ Xatolar: <b>{failed}</b>"
                 )
 
@@ -347,18 +356,12 @@ async def _run_auto_check_once():
             f"🆕 Topildi: <b>{total}</b>\n"
             f"💾 Bazaga: <b>{inserted}</b>\n"
             f"🎯 Filterga mos: <b>{filtered}</b>\n"
-            f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
+            f"📄 PDF yuklandi: <b>{pdf_downloaded}</b>\n"
+            f"📨 PDF yuborildi: <b>{pdf_sent}</b>\n"
             f"⚠️ Xatolar: <b>{failed}</b>"
         )
 
-        if pdf_queue:
-            await _notify_admins("📨 <b>Auto-check:</b> saralanganlar uchun PDF yuborish boshlandi")
-            for output_path, cert in pdf_queue:
-                await _send_pdf_to_admins(output_path, cert)
-                pdf_sent += 1
-                await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
-            await _notify_admins(f"✅ <b>Auto-check:</b> PDF yuborildi: <b>{pdf_sent}</b>")
-        else:
+        if pdf_sent == 0:
             await _notify_admins("ℹ️ <b>Auto-check:</b> yuborishga saralangan PDF topilmadi")
 
     except Exception as e:
@@ -798,15 +801,25 @@ async def cb_confirm_download(callback: CallbackQuery):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         downloaded = 0
+        sent = 0
         total      = len(filtered_certs)
-        downloaded_items: list[tuple[str, Certificate]] = []
 
         for i, cert in enumerate(filtered_certs, 1):
             if cert.uuid:
                 output_path = os.path.join(DOWNLOAD_DIR, f"{cert.uuid}.pdf")
                 if await parser.download_pdf(cert.uuid, output_path):
                     downloaded += 1
-                    downloaded_items.append((output_path, cert))
+                    try:
+                        await send_pdf_document(callback.message, output_path, cert)
+                        sent += 1
+                    except Exception as e:
+                        logger.error(f"PDF yuborish xato: {e}")
+                    finally:
+                        if os.path.exists(output_path):
+                            try:
+                                os.remove(output_path)
+                            except Exception as e:
+                                logger.debug(f"PDF o'chirish xato (path={output_path}): {e}")
 
             if i % DOWNLOAD_PROGRESS_EVERY_ITEMS == 0 or i == total:
                 try:
@@ -821,28 +834,11 @@ async def cb_confirm_download(callback: CallbackQuery):
 
             await asyncio.sleep(DOWNLOAD_ITEM_DELAY_SECONDS)
 
-        if downloaded_items:
-            try:
-                await progress_msg.edit_text(
-                    f"📨 <b>PDF yuborish boshlandi...</b>\n\n"
-                    f"Tayyor: <b>{len(downloaded_items)}</b>",
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception:
-                pass
-
-            for output_path, cert in downloaded_items:
-                try:
-                    await send_pdf_document(callback.message, output_path, cert)
-                except Exception as e:
-                    logger.error(f"PDF yuborish xato: {e}")
-                await asyncio.sleep(DOWNLOAD_ITEM_DELAY_SECONDS)
-
         await progress_msg.edit_text(
             f"✅ <b>PDF yuklash yakunlandi!</b>\n\n"
             f"Jami: <b>{total}</b>\n"
             f"Yuklandi: <b>{downloaded}</b>\n"
-            f"Yuborildi: <b>{len(downloaded_items)}</b>\n\n"
+            f"Yuborildi: <b>{sent}</b>\n\n"
             f"Amalni tanlang:",
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_keyboard()

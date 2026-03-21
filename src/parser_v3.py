@@ -11,7 +11,6 @@ import os
 import time
 import random
 import json
-import base64
 import urllib.request
 from typing import List, Optional, Callable, Dict, Any, Set
 from concurrent.futures import ThreadPoolExecutor
@@ -488,46 +487,24 @@ class _SyncWorker:
     def download_pdf(self, uuid: str, output_path: str) -> bool:
         try:
             pdf_url = f"{DOC_URL}/certificate/uuid/{uuid}/pdf?language=uz&download"
+            req = urllib.request.Request(
+                pdf_url,
+                method="GET",
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/pdf,*/*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content_http = resp.read()
 
-            # 1) Request-first usul
-            try:
-                req = urllib.request.Request(
-                    pdf_url,
-                    method="GET",
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Accept": "application/pdf,*/*",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    content_http = resp.read()
-                if content_http and content_http[:4] == b"%PDF":
-                    with open(output_path, 'wb') as f:
-                        f.write(content_http)
-                    logger.info(f"PDF saqlandi (http): {output_path}")
-                    return True
-            except Exception as e:
-                logger.debug(f"HTTP orqali PDF xato (fallback bo'ladi), uuid={uuid}: {e}")
-
-            # 2) Fallback: brauzer fetch
-            content = self.driver.execute_async_script("""
-                const done = arguments[arguments.length - 1];
-                fetch(arguments[0])
-                    .then(r => r.arrayBuffer())
-                    .then(buf => {
-                        const b = new Uint8Array(buf);
-                        let s = '';
-                        for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-                        done(btoa(s));
-                    })
-                    .catch(() => done(null));
-            """, pdf_url)
-
-            if content:
+            if content_http and content_http[:4] == b"%PDF":
                 with open(output_path, 'wb') as f:
-                    f.write(base64.b64decode(content))
-                logger.info(f"PDF saqlandi: {output_path}")
+                    f.write(content_http)
+                logger.info(f"PDF saqlandi (http): {output_path}")
                 return True
+
+            logger.warning(f"PDF bo'sh yoki noto'g'ri format: {uuid}")
             return False
         except Exception as e:
             logger.error(f"download_pdf xato: {e}")
