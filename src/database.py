@@ -283,6 +283,25 @@ class Database:
             row = await cur.fetchone()
             return self._row(row) if row else None
 
+    async def get_certificate_by_number(self, number: str) -> Optional[Certificate]:
+        normalized = str(number).strip()
+        if not normalized:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT *
+                FROM certificates
+                WHERE number = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (normalized,),
+            )
+            row = await cur.fetchone()
+            return self._row(row) if row else None
+
     async def count_certificates(self) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT COUNT(*) FROM certificates")

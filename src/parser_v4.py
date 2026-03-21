@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 import inspect
+from urllib.parse import quote_plus
 
 from loguru import logger
 
@@ -33,6 +34,7 @@ from database import Certificate
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 API_TARGET = "api.licenses.uz/v1/register/open_source"
+REGISTRY_BY_NUMBER_URL = "https://license.gov.uz/registry?filter%5Bnumber%5D={number}"
 
 REGISTRY_URL = (
     f"{BASE_URL}/registry"
@@ -490,8 +492,12 @@ class LicenseParserV4:
         cooldown_seconds: float = 0.0,
     ) -> Dict[str, Certificate]:
         """
-        Hujjat raqamlari bo'yicha sertifikatlarni qayta topadi.
-        Sahifalar ketma-ket ochiladi, topilganlar number->Certificate ko'rinishida qaytadi.
+        Hujjat raqamlari bo'yicha registry sahifasini ochib tekshiradi.
+        Har bir number uchun:
+        1) https://license.gov.uz/registry?filter%5Bnumber%5D=<number> ochiladi
+        2) Shu sahifadan ketadigan background API response interception qilinadi
+
+        Qaytish formati: {normalized_number: Certificate}
         """
         normalized_targets = {_normalize_number(n) for n in target_numbers if _normalize_number(n)}
         found: Dict[str, Certificate] = {}
@@ -499,61 +505,52 @@ class LicenseParserV4:
         if not normalized_targets:
             return found
 
-        raw0 = await self.fetch_page(0)
-        total_pages = max(1, int((raw0.get("data") or {}).get("totalPages") or 1))
-        total_pages = min(total_pages, max_pages)
-
-        async def _handle_page(page_0: int, raw: Dict):
-            items = (raw.get("data") or {}).get("certificates") or []
-            for item in items:
-                normalized = _normalize_number(item.get("number"))
-                if normalized and normalized in normalized_targets and normalized not in found:
-                    try:
-                        cert = _api_item_to_cert(item)
-                        if cert.uuid:
-                            found[normalized] = cert
-                    except Exception as e:
-                        logger.warning(f"item parse xato: {e}")
-
-        await _handle_page(0, raw0)
-        if progress_callback:
-            result = progress_callback(1, total_pages, len(found), len(normalized_targets))
-            if inspect.isawaitable(result):
-                await result
-
-        if len(found) >= len(normalized_targets):
-            return found
-
-        for page_0 in range(1, total_pages):
+        ordered_numbers = sorted(normalized_targets)
+        total = len(ordered_numbers)
+        for idx, number in enumerate(ordered_numbers, 1):
+            registry_url = REGISTRY_BY_NUMBER_URL.format(number=quote_plus(number))
             try:
-                raw = await self.fetch_page(page_0)
-            except PageFetchError as e:
+                await self._drain_old_responses()
+
+                logger.debug(f"Auto-update number lookup: {number} | {registry_url}")
+                await self._page.goto(registry_url, wait_until="domcontentloaded", timeout=60_000)
+
+                payload = await self._wait_for_registry_number_api(number, timeout=25.0)
+                items = (payload.get("data") or {}).get("certificates") or []
+
+                chosen: Optional[Dict[str, Any]] = None
+                for item in items:
+                    if _normalize_number(item.get("number")) == number:
+                        chosen = item
+                        break
+                if not chosen and items:
+                    chosen = items[0]
+
+                if chosen:
+                    cert = _api_item_to_cert(chosen)
+                    if cert.uuid:
+                        found[number] = cert
+
+            except Exception as e:
                 if not continue_on_page_error:
                     raise
-                logger.warning(f"fetch_by_document_numbers skip page={page_0 + 1}: {e}")
+                logger.warning(f"fetch_by_document_numbers number={number} xato: {e}")
                 if error_callback:
-                    result = error_callback(page_0 + 1, total_pages, e)
+                    result = error_callback(idx, total, e)
                     if inspect.isawaitable(result):
                         await result
-                continue
 
-            await _handle_page(page_0, raw)
             if progress_callback:
-                result = progress_callback(page_0 + 1, total_pages, len(found), len(normalized_targets))
+                result = progress_callback(idx, total, len(found), len(normalized_targets))
                 if inspect.isawaitable(result):
                     await result
 
-            if len(found) >= len(normalized_targets):
-                logger.info("Barcha target raqamlar topildi, skan to'xtatildi")
-                break
-
-            await asyncio.sleep(random.uniform(0.4, 1.0))
-
+            await asyncio.sleep(random.uniform(0.25, 0.6))
             if (
                 cooldown_every_pages > 0
                 and cooldown_seconds > 0
-                and (page_0 + 1) % cooldown_every_pages == 0
-                and (page_0 + 1) < total_pages
+                and idx % cooldown_every_pages == 0
+                and idx < total
             ):
                 await asyncio.sleep(cooldown_seconds)
 
@@ -561,6 +558,33 @@ class LicenseParserV4:
             f"fetch_by_document_numbers yakunlandi: found={len(found)}/{len(normalized_targets)}"
         )
         return found
+
+    async def _wait_for_registry_number_api(self, expected_number: str, timeout: float = 25.0) -> Dict[str, Any]:
+        """
+        Registry sahifasidan ketgan API response ni queue dan topadi.
+        expected_number ga mos certificates response kelmaguncha kutadi.
+        """
+        expected = _normalize_number(expected_number)
+        deadline = asyncio.get_event_loop().time() + timeout
+
+        while asyncio.get_event_loop().time() < deadline:
+            remaining = deadline - asyncio.get_event_loop().time()
+            try:
+                payload = await asyncio.wait_for(
+                    self._response_queue.get(), timeout=min(2.0, remaining)
+                )
+            except asyncio.TimeoutError:
+                continue
+
+            items = (payload.get("data") or {}).get("certificates") or []
+            if not items:
+                continue
+
+            for item in items:
+                if _normalize_number(item.get("number")) == expected:
+                    return payload
+
+        raise TimeoutError(f"Registry background API timeout, number={expected}")
 
     # ── PDF yuklash ───────────────────────────────────────────────────────────
 

@@ -62,6 +62,9 @@ db = Database()
 
 parser: Optional[LicenseParser] = None
 scrape_lock = asyncio.Lock()
+process_state_lock = asyncio.Lock()
+active_process_name: Optional[str] = None
+active_process_started_at: Optional[datetime] = None
 background_tasks: list[asyncio.Task] = []
 
 
@@ -130,6 +133,69 @@ def get_confirm_keyboard(action: str) -> InlineKeyboardMarkup:
 
 def _check_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
+
+
+def _normalize_number(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(int(raw))
+    except (TypeError, ValueError):
+        return raw
+
+
+def _cert_signature(cert: Optional[Certificate]) -> tuple:
+    if cert is None:
+        return tuple()
+    return (
+        _normalize_number(cert.number),
+        cert.register_number or "",
+        cert.name or "",
+        str(cert.tin or ""),
+        cert.pin or "",
+        cert.region_uz or "",
+        cert.sub_region_uz or "",
+        cert.address or "",
+        cert.activity_addresses or "",
+        cert.registration_date or "",
+        cert.expiry_date or "",
+        cert.revoke_date or "",
+        cert.status or "",
+        bool(cert.active),
+        cert.specializations or "",
+        cert.specialization_ids or "",
+        bool(cert.is_filtered),
+    )
+
+
+def _current_process_label() -> str:
+    global active_process_name, active_process_started_at
+    if not active_process_name:
+        return "noma'lum jarayon"
+    if not active_process_started_at:
+        return active_process_name
+    elapsed = int((datetime.now() - active_process_started_at).total_seconds())
+    return f"{active_process_name} ({elapsed}s)"
+
+
+async def _try_start_process(process_name: str) -> bool:
+    global active_process_name, active_process_started_at
+    async with process_state_lock:
+        if scrape_lock.locked():
+            return False
+        await scrape_lock.acquire()
+        active_process_name = process_name
+        active_process_started_at = datetime.now()
+        return True
+
+
+def _finish_process():
+    global active_process_name, active_process_started_at
+    active_process_name = None
+    active_process_started_at = None
+    if scrape_lock.locked():
+        scrape_lock.release()
 
 
 async def _send_screenshot(chat_id: int, screenshot_path: str, caption: str = ""):
@@ -212,8 +278,10 @@ def _seconds_until_next_daily_run(tz_name: str, hour: int, minute: int) -> float
 
 
 async def _run_auto_check_once():
-    if scrape_lock.locked():
-        await _notify_admins("⏭️ <b>Auto-check skip:</b> boshqa jarayon ketmoqda")
+    if not await _try_start_process("auto-check"):
+        await _notify_admins(
+            f"⏭️ <b>Auto-check skip:</b> boshqa jarayon ketmoqda: <b>{html.escape(_current_process_label())}</b>"
+        )
         return
 
     await _notify_admins(
@@ -223,176 +291,191 @@ async def _run_auto_check_once():
 
     parser_local: Optional[LicenseParser] = None
 
-    async with scrape_lock:
-        try:
-            parser_local = LicenseParser()
-            await parser_local.init_browser(headless=True)
-            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    try:
+        parser_local = LicenseParser()
+        await parser_local.init_browser(headless=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-            existing_numbers = await db.get_existing_numbers_set()
-            new_certs = await parser_local.fetch_new_since(
-                existing_numbers=existing_numbers,
-                max_pages=AUTO_CHECK_MAX_PAGES,
-            )
+        existing_numbers = await db.get_existing_numbers_set()
+        new_certs = await parser_local.fetch_new_since(
+            existing_numbers=existing_numbers,
+            max_pages=AUTO_CHECK_MAX_PAGES,
+        )
 
-            if not new_certs:
-                await _notify_admins("✅ <b>Auto-check:</b> yangi sertifikat topilmadi")
-                return
+        if not new_certs:
+            await _notify_admins("✅ <b>Auto-check:</b> yangi sertifikat topilmadi")
+            return
 
-            inserted = 0
-            filtered = 0
-            pdf_ready = 0
-            pdf_sent = 0
-            failed = 0
-            pdf_queue: list[tuple[str, Certificate]] = []
+        inserted = 0
+        filtered = 0
+        pdf_ready = 0
+        pdf_sent = 0
+        failed = 0
+        pdf_queue: list[tuple[str, Certificate]] = []
 
-            total = len(new_certs)
-            for idx, cert in enumerate(new_certs, 1):
-                try:
-                    await db.upsert_certificate(cert)
-                    inserted += 1
+        total = len(new_certs)
+        for idx, cert in enumerate(new_certs, 1):
+            try:
+                await db.upsert_certificate(cert)
+                inserted += 1
 
-                    if cert.is_filtered and cert.uuid:
-                        filtered += 1
-                        output_path = os.path.join(DOWNLOAD_DIR, f"auto_{cert.uuid}.pdf")
-                        if await parser_local.download_pdf(cert.uuid, output_path):
-                            pdf_queue.append((output_path, cert))
-                            pdf_ready += 1
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Auto-check item xato (uuid={cert.uuid}): {e}")
+                if cert.is_filtered and cert.uuid:
+                    filtered += 1
+                    output_path = os.path.join(DOWNLOAD_DIR, f"auto_{cert.uuid}.pdf")
+                    if await parser_local.download_pdf(cert.uuid, output_path):
+                        pdf_queue.append((output_path, cert))
+                        pdf_ready += 1
+            except Exception as e:
+                failed += 1
+                logger.error(f"Auto-check item xato (uuid={cert.uuid}): {e}")
 
-                if idx % AUTO_CHECK_NOTIFY_EVERY_ITEMS == 0 or idx == total:
-                    await _notify_admins(
-                        f"🔎 <b>Auto-check davom etmoqda</b>\n\n"
-                        f"{idx}/{total}\n"
-                        f"💾 Bazaga: <b>{inserted}</b>\n"
-                        f"🎯 Filterga mos: <b>{filtered}</b>\n"
-                        f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
-                        f"⚠️ Xatolar: <b>{failed}</b>"
-                    )
+            if idx % AUTO_CHECK_NOTIFY_EVERY_ITEMS == 0 or idx == total:
+                await _notify_admins(
+                    f"🔎 <b>Auto-check davom etmoqda</b>\n\n"
+                    f"{idx}/{total}\n"
+                    f"💾 Bazaga: <b>{inserted}</b>\n"
+                    f"🎯 Filterga mos: <b>{filtered}</b>\n"
+                    f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
+                    f"⚠️ Xatolar: <b>{failed}</b>"
+                )
 
+            await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
+
+        await _notify_admins(
+            f"✅ <b>Auto-check yakunlandi</b>\n\n"
+            f"🆕 Topildi: <b>{total}</b>\n"
+            f"💾 Bazaga: <b>{inserted}</b>\n"
+            f"🎯 Filterga mos: <b>{filtered}</b>\n"
+            f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
+            f"⚠️ Xatolar: <b>{failed}</b>"
+        )
+
+        if pdf_queue:
+            await _notify_admins("📨 <b>Auto-check:</b> saralanganlar uchun PDF yuborish boshlandi")
+            for output_path, cert in pdf_queue:
+                await _send_pdf_to_admins(output_path, cert)
+                pdf_sent += 1
                 await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
+            await _notify_admins(f"✅ <b>Auto-check:</b> PDF yuborildi: <b>{pdf_sent}</b>")
+        else:
+            await _notify_admins("ℹ️ <b>Auto-check:</b> yuborishga saralangan PDF topilmadi")
 
-            await _notify_admins(
-                f"✅ <b>Auto-check yakunlandi</b>\n\n"
-                f"🆕 Topildi: <b>{total}</b>\n"
-                f"💾 Bazaga: <b>{inserted}</b>\n"
-                f"🎯 Filterga mos: <b>{filtered}</b>\n"
-                f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
-                f"⚠️ Xatolar: <b>{failed}</b>"
-            )
-
-            if pdf_queue:
-                await _notify_admins("📨 <b>Auto-check:</b> saralanganlar uchun PDF yuborish boshlandi")
-                for output_path, cert in pdf_queue:
-                    await _send_pdf_to_admins(output_path, cert)
-                    pdf_sent += 1
-                    await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
-                await _notify_admins(f"✅ <b>Auto-check:</b> PDF yuborildi: <b>{pdf_sent}</b>")
-            else:
-                await _notify_admins("ℹ️ <b>Auto-check:</b> yuborishga saralangan PDF topilmadi")
-
-        except Exception as e:
-            logger.error(f"Auto-check xato: {e}")
-            await _notify_admins(
-                f"❌ <b>Auto-check xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>"
-            )
-        finally:
-            if parser_local:
-                await parser_local.close()
+    except Exception as e:
+        logger.error(f"Auto-check xato: {e}")
+        await _notify_admins(
+            f"❌ <b>Auto-check xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>"
+        )
+    finally:
+        if parser_local:
+            await parser_local.close()
+        _finish_process()
 
 
 async def _run_auto_update_once():
-    if scrape_lock.locked():
-        await _notify_admins("⏭️ <b>Auto-update skip:</b> boshqa jarayon ketmoqda")
+    if not await _try_start_process("auto-update"):
+        await _notify_admins(
+            f"⏭️ <b>Auto-update skip:</b> boshqa jarayon ketmoqda: <b>{html.escape(_current_process_label())}</b>"
+        )
         return
 
     parser_local: Optional[LicenseParser] = None
 
-    async with scrape_lock:
-        try:
-            targets = await db.get_filtered_numbers_set()
-            if not targets:
-                await _notify_admins("ℹ️ <b>Auto-update:</b> saralangan sertifikat topilmadi")
-                return
+    try:
+        targets = await db.get_filtered_numbers_set()
+        if not targets:
+            await _notify_admins("ℹ️ <b>Auto-update:</b> saralangan sertifikat topilmadi")
+            return
 
-            await _notify_admins(
-                f"🔄 <b>Auto-update boshlandi</b>\n\n"
-                f"Saralangan hujjatlar: <b>{len(targets)}</b>\n"
-                f"Qayta tekshiruv hujjat raqami bo'yicha ketmoqda..."
-            )
+        await _notify_admins(
+            f"🔄 <b>Auto-update boshlandi</b>\n\n"
+            f"Saralangan hujjatlar: <b>{len(targets)}</b>\n"
+            f"Qidiruv URL: <code>https://license.gov.uz/registry?filter%5Bnumber%5D=...</code>\n"
+            f"API: <code>/v1/register/open_source?number=...&page=0&size=10</code>"
+        )
 
-            parser_local = LicenseParser()
-            await parser_local.init_browser(headless=True)
+        parser_local = LicenseParser()
+        await parser_local.init_browser(headless=True)
 
-            async def on_progress(page: int, total_pages: int, found: int, needed: int):
-                if page % AUTO_UPDATE_PROGRESS_EVERY_PAGES == 0 or page == total_pages:
-                    await _notify_admins(
-                        f"🔄 <b>Auto-update davom etmoqda</b>\n\n"
-                        f"📄 Sahifa: <b>{page}/{total_pages}</b>\n"
-                        f"🎯 Topildi: <b>{found}/{needed}</b>"
-                    )
+        async def on_progress(done: int, total: int, found: int, needed: int):
+            if done % AUTO_UPDATE_PROGRESS_EVERY_PAGES == 0 or done == total:
+                await _notify_admins(
+                    f"🔄 <b>Auto-update qidiruv davom etmoqda</b>\n\n"
+                    f"🔎 Tekshirildi: <b>{done}/{total}</b>\n"
+                    f"🎯 Topildi: <b>{found}/{needed}</b>"
+                )
 
-            found_map = await parser_local.fetch_by_document_numbers(
-                target_numbers=targets,
-                max_pages=AUTO_UPDATE_MAX_PAGES,
-                progress_callback=on_progress,
-                continue_on_page_error=True,
-                cooldown_every_pages=SCRAPE_COOLDOWN_EVERY_PAGES,
-                cooldown_seconds=SCRAPE_COOLDOWN_SECONDS,
-            )
+        found_map = await parser_local.fetch_by_document_numbers(
+            target_numbers=targets,
+            max_pages=AUTO_UPDATE_MAX_PAGES,
+            progress_callback=on_progress,
+            continue_on_page_error=True,
+            cooldown_every_pages=SCRAPE_COOLDOWN_EVERY_PAGES,
+            cooldown_seconds=SCRAPE_COOLDOWN_SECONDS,
+        )
 
-            updated = 0
-            failed = 0
-            pdf_ready = 0
-            pdf_sent = 0
-            pdf_queue: list[tuple[str, Certificate]] = []
-            for number, cert in found_map.items():
-                try:
+        changed = 0
+        unchanged = 0
+        inserted = 0
+        failed = 0
+        processed = 0
+
+        for number, cert in found_map.items():
+            processed += 1
+            try:
+                old_cert = await db.get_certificate_by_number(number)
+                has_old = old_cert is not None
+                is_changed = _cert_signature(old_cert) != _cert_signature(cert)
+
+                if has_old and not is_changed:
+                    unchanged += 1
+                else:
                     await db.upsert_certificate(cert)
-                    updated += 1
-                    if cert.is_filtered and cert.uuid:
-                        output_path = os.path.join(DOWNLOAD_DIR, f"autoupdate_{cert.uuid}.pdf")
-                        if await parser_local.download_pdf(cert.uuid, output_path):
-                            pdf_queue.append((output_path, cert))
-                            pdf_ready += 1
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Auto-update DB xato (number={number}, uuid={cert.uuid}): {e}")
-                await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
+                    if has_old:
+                        changed += 1
+                    else:
+                        inserted += 1
+            except Exception as e:
+                failed += 1
+                logger.error(f"Auto-update DB xato (number={number}, uuid={cert.uuid}): {e}")
 
-            missing = max(0, len(targets) - len(found_map))
+            if (
+                processed % AUTO_UPDATE_PROGRESS_EVERY_PAGES == 0
+                or processed == len(found_map)
+            ):
+                await _notify_admins(
+                    f"🔄 <b>Auto-update DB bosqichi</b>\n\n"
+                    f"💾 Tekshirildi: <b>{processed}/{len(found_map)}</b>\n"
+                    f"🆕 Yangi qo'shildi: <b>{inserted}</b>\n"
+                    f"♻️ O'zgargani update qilindi: <b>{changed}</b>\n"
+                    f"➖ O'zgarmagan: <b>{unchanged}</b>\n"
+                    f"⚠️ Xatolar: <b>{failed}</b>"
+                )
 
-            await _notify_admins(
-                f"✅ <b>Auto-update yakunlandi</b>\n\n"
-                f"🧾 Target: <b>{len(targets)}</b>\n"
-                f"🔎 Saytdan topildi: <b>{len(found_map)}</b>\n"
-                f"💾 DB update: <b>{updated}</b>\n"
-                f"📄 PDF tayyor: <b>{pdf_ready}</b>\n"
-                f"❓ Topilmadi: <b>{missing}</b>\n"
-                f"⚠️ Xatolar: <b>{failed}</b>"
-            )
+            await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
 
-            if pdf_queue:
-                await _notify_admins("📨 <b>Auto-update:</b> saralanganlar uchun PDF yuborish boshlandi")
-                for output_path, cert in pdf_queue:
-                    await _send_pdf_to_admins(output_path, cert)
-                    pdf_sent += 1
-                    await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
-                await _notify_admins(f"✅ <b>Auto-update:</b> PDF yuborildi: <b>{pdf_sent}</b>")
-            else:
-                await _notify_admins("ℹ️ <b>Auto-update:</b> yuborishga saralangan PDF topilmadi")
+        missing = max(0, len(targets) - len(found_map))
 
-        except Exception as e:
-            logger.error(f"Auto-update xato: {e}")
-            await _notify_admins(
-                f"❌ <b>Auto-update xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>"
-            )
-        finally:
-            if parser_local:
-                await parser_local.close()
+        await _notify_admins(
+            f"✅ <b>Auto-update yakunlandi</b>\n\n"
+            f"🧾 Target: <b>{len(targets)}</b>\n"
+            f"🔎 API'dan topildi: <b>{len(found_map)}</b>\n"
+            f"🆕 Yangi qo'shildi: <b>{inserted}</b>\n"
+            f"♻️ O'zgargani update qilindi: <b>{changed}</b>\n"
+            f"➖ O'zgarmagan: <b>{unchanged}</b>\n"
+            f"❓ Topilmadi: <b>{missing}</b>\n"
+            f"⚠️ Xatolar: <b>{failed}</b>"
+        )
+
+    except Exception as e:
+        logger.error(f"Auto-update xato: {e}")
+        await _notify_admins(
+            f"❌ <b>Auto-update xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>"
+        )
+    finally:
+        if parser_local:
+            await parser_local.close()
+        _finish_process()
 
 
 async def _auto_check_worker():
@@ -491,7 +574,10 @@ async def cb_scrape(callback: CallbackQuery):
     except Exception as e:
         logger.debug(f"Callback answer xato: {e}")
     if scrape_lock.locked():
-        await callback.message.answer("⚠️ Jarayon davom etmoqda, kuting...")
+        await callback.message.answer(
+            f"⚠️ Jarayon davom etmoqda: <b>{html.escape(_current_process_label())}</b>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     await callback.message.edit_text(
         "📥 <b>Barcha sertifikatlarni yig'ish</b>\n\n"
@@ -512,6 +598,13 @@ async def cb_confirm_scrape(callback: CallbackQuery):
         logger.debug(f"Callback answer xato: {e}")
     global parser
 
+    if not await _try_start_process("manual-scrape"):
+        await callback.message.answer(
+            f"⚠️ Yangi jarayon boshlandi emas. Band jarayon: <b>{html.escape(_current_process_label())}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     progress_msg = await callback.message.edit_text(
         "🚀 <b>Yig'ish boshlandi...</b>\n\n"
         "📄 Sahifa: <b>0/0</b>\n"
@@ -521,79 +614,78 @@ async def cb_confirm_scrape(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
 
-    async with scrape_lock:
-        try:
-            parser = LicenseParser()
-            await parser.init_browser(headless=True)
+    try:
+        parser = LicenseParser()
+        await parser.init_browser(headless=True)
 
-            total_saved    = 0
-            total_filtered = 0
-            current_page   = 0
-            total_pages    = 0
-            skipped_pages  = 0
-            failed_writes  = 0
+        total_saved    = 0
+        total_filtered = 0
+        current_page   = 0
+        total_pages    = 0
+        skipped_pages  = 0
+        failed_writes  = 0
 
-            async def on_page_done(page: int, total: int, page_certs: list):
-                nonlocal total_saved, total_filtered, current_page, total_pages, failed_writes
-                current_page = page
-                total_pages  = total
+        async def on_page_done(page: int, total: int, page_certs: list):
+            nonlocal total_saved, total_filtered, current_page, total_pages, failed_writes
+            current_page = page
+            total_pages  = total
 
-                for cert in page_certs:
-                    try:
-                        await db.upsert_certificate(cert)
-                        total_saved += 1
-                    except Exception as e:
-                        failed_writes += 1
-                        logger.error(f"DB upsert xato (uuid={cert.uuid}): {e}")
+            for cert in page_certs:
+                try:
+                    await db.upsert_certificate(cert)
+                    total_saved += 1
+                except Exception as e:
+                    failed_writes += 1
+                    logger.error(f"DB upsert xato (uuid={cert.uuid}): {e}")
 
-                total_filtered = await db.count_filtered_certificates()
+            total_filtered = await db.count_filtered_certificates()
 
-                if page % SCRAPE_UPDATE_EVERY_PAGES == 0 or page == total:
-                    try:
-                        await progress_msg.edit_text(
-                            f"🚀 <b>Yig'ish davom etmoqda...</b>\n\n"
-                            f"📄 Sahifa: <b>{page}/{total}</b>\n"
-                            f"💾 Saqlandi: <b>{total_saved}</b>\n"
-                            f"🎓 Saralandi: <b>{total_filtered}</b>\n\n"
-                            f"⏳ Kuting...",
-                            parse_mode=ParseMode.HTML
-                        )
-                    except Exception:
-                        pass
+            if page % SCRAPE_UPDATE_EVERY_PAGES == 0 or page == total:
+                try:
+                    await progress_msg.edit_text(
+                        f"🚀 <b>Yig'ish davom etmoqda...</b>\n\n"
+                        f"📄 Sahifa: <b>{page}/{total}</b>\n"
+                        f"💾 Saqlandi: <b>{total_saved}</b>\n"
+                        f"🎓 Saralandi: <b>{total_filtered}</b>\n\n"
+                        f"⏳ Kuting...",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
 
-            async def on_page_error(page: int, total: int, err: Exception):
-                nonlocal skipped_pages, current_page, total_pages
-                skipped_pages += 1
-                current_page = page
-                total_pages = total
-                logger.warning(f"Sahifa skip qilindi: {page}/{total} ({err})")
+        async def on_page_error(page: int, total: int, err: Exception):
+            nonlocal skipped_pages, current_page, total_pages
+            skipped_pages += 1
+            current_page = page
+            total_pages = total
+            logger.warning(f"Sahifa skip qilindi: {page}/{total} ({err})")
 
-            await parser.scrape_all(
-                progress_callback=on_page_done,
-                start_page_1indexed=SCRAPE_START_PAGE,
-                continue_on_page_error=SCRAPE_CONTINUE_ON_PAGE_ERROR,
-                error_callback=on_page_error,
-                cooldown_every_pages=SCRAPE_COOLDOWN_EVERY_PAGES,
-                cooldown_seconds=SCRAPE_COOLDOWN_SECONDS,
-            )
+        await parser.scrape_all(
+            progress_callback=on_page_done,
+            start_page_1indexed=SCRAPE_START_PAGE,
+            continue_on_page_error=SCRAPE_CONTINUE_ON_PAGE_ERROR,
+            error_callback=on_page_error,
+            cooldown_every_pages=SCRAPE_COOLDOWN_EVERY_PAGES,
+            cooldown_seconds=SCRAPE_COOLDOWN_SECONDS,
+        )
 
-            total_in_db    = await db.count_certificates()
-            filtered_in_db = await db.count_filtered_certificates()
+        total_in_db    = await db.count_certificates()
+        filtered_in_db = await db.count_filtered_certificates()
 
-            await progress_msg.edit_text(
-                f"✅ <b>Yig'ish yakunlandi!</b>\n\n"
-                f"📄 Sahifalar: <b>{current_page}/{total_pages}</b>\n"
-                f"💾 Saqlandi: <b>{total_saved}</b>\n"
-                f"⏭️ Skip sahifalar: <b>{skipped_pages}</b>\n"
-                f"⚠️ DB yozish xatolari: <b>{failed_writes}</b>\n"
-                f"🎓 Saralandi («{TARGET_ACTIVITY_TYPE}»): <b>{filtered_in_db}</b>\n"
-                f"📊 Bazada jami: <b>{total_in_db}</b>\n\n"
-                f"Amalni tanlang:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=get_main_keyboard()
-            )
+        await progress_msg.edit_text(
+            f"✅ <b>Yig'ish yakunlandi!</b>\n\n"
+            f"📄 Sahifalar: <b>{current_page}/{total_pages}</b>\n"
+            f"💾 Saqlandi: <b>{total_saved}</b>\n"
+            f"⏭️ Skip sahifalar: <b>{skipped_pages}</b>\n"
+            f"⚠️ DB yozish xatolari: <b>{failed_writes}</b>\n"
+            f"🎓 Saralandi («{TARGET_ACTIVITY_TYPE}»): <b>{filtered_in_db}</b>\n"
+            f"📊 Bazada jami: <b>{total_in_db}</b>\n\n"
+            f"Amalni tanlang:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
 
-        except PageFetchError as e:
+    except PageFetchError as e:
             logger.error(f"PageFetchError: {e}")
             saved_so_far = await db.count_certificates()
 
@@ -617,7 +709,7 @@ async def cb_confirm_scrape(callback: CallbackQuery):
                     ),
                 )
 
-        except Exception as e:
+    except Exception as e:
             logger.error(f"Scraping xato: {e}")
             saved_so_far = await db.count_certificates()
 
@@ -644,10 +736,11 @@ async def cb_confirm_scrape(callback: CallbackQuery):
                     caption="📸 <b>Xato vaqtidagi ekran holati</b>",
                 )
 
-        finally:
-            if parser:
-                await parser.close()
-                parser = None
+    finally:
+        if parser:
+            await parser.close()
+            parser = None
+        _finish_process()
 
 
 @dp.callback_query(F.data == "download_pdfs")
@@ -673,6 +766,13 @@ async def cb_confirm_download(callback: CallbackQuery):
     except Exception as e:
         logger.debug(f"Callback answer xato: {e}")
     global parser
+
+    if not await _try_start_process("manual-download"):
+        await callback.message.answer(
+            f"⚠️ Yangi jarayon boshlandi emas. Band jarayon: <b>{html.escape(_current_process_label())}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     progress_msg = await callback.message.edit_text(
         "📄 <b>PDF yuklash boshlandi...</b>\n\n⏳ Kuting...",
@@ -757,6 +857,7 @@ async def cb_confirm_download(callback: CallbackQuery):
         if parser:
             await parser.close()
             parser = None
+        _finish_process()
 
 
 @dp.callback_query(F.data == "cancel")
