@@ -145,26 +145,54 @@ def _normalize_number(value: Optional[str]) -> str:
         return raw
 
 
+_TEXT_CANON_MAP = str.maketrans({
+    "А": "A", "В": "V", "Е": "E", "К": "K", "М": "M", "Н": "N", "О": "O",
+    "Р": "R", "С": "S", "Т": "T", "У": "U", "Х": "X", "Ҳ": "H", "Қ": "Q",
+    "Ғ": "G", "Ў": "O", "Ё": "YO", "Й": "Y", "Л": "L", "Д": "D", "Ж": "J",
+    "З": "Z", "И": "I", "П": "P", "Ф": "F", "Ч": "CH", "Ш": "SH", "Я": "YA",
+    "Ю": "YU", "Ц": "S", "Ь": "", "Ъ": "", "Ы": "I", "Э": "E",
+    "а": "A", "в": "V", "е": "E", "к": "K", "м": "M", "н": "N", "о": "O",
+    "р": "R", "с": "S", "т": "T", "у": "U", "х": "X", "ҳ": "H", "қ": "Q",
+    "ғ": "G", "ў": "O", "ё": "YO", "й": "Y", "л": "L", "д": "D", "ж": "J",
+    "з": "Z", "и": "I", "п": "P", "ф": "F", "ч": "CH", "ш": "SH", "я": "YA",
+    "ю": "YU", "ц": "S", "ь": "", "ъ": "", "ы": "I", "э": "E",
+    "’": "'", "`": "'", "ʻ": "'", "ʼ": "'", "ʹ": "'", "´": "'", "‘": "'",
+})
+
+
+def _canon_text(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.translate(_TEXT_CANON_MAP).upper()
+    return "".join(ch for ch in normalized if ch.isalnum())
+
+
+def _canon_json_like(value: Optional[str]) -> str:
+    """Normalize list-like JSON/text fields for stable equality checks."""
+    return _canon_text(value)
+
+
 def _cert_signature(cert: Optional[Certificate]) -> tuple:
     if cert is None:
         return tuple()
     return (
-        _normalize_number(cert.number),
-        cert.register_number or "",
-        cert.name or "",
-        str(cert.tin or ""),
-        cert.pin or "",
-        cert.region_uz or "",
-        cert.sub_region_uz or "",
-        cert.address or "",
-        cert.activity_addresses or "",
-        cert.registration_date or "",
-        cert.expiry_date or "",
-        cert.revoke_date or "",
+        _canon_text(_normalize_number(cert.number)),
+        _canon_text(cert.register_number),
+        _canon_text(cert.name),
+        _canon_text(str(cert.tin or "")),
+        _canon_text(cert.pin),
+        _canon_text(cert.region_uz),
+        _canon_text(cert.sub_region_uz),
+        _canon_text(cert.address),
+        _canon_json_like(cert.activity_addresses),
+        _canon_text(cert.registration_date),
+        _canon_text(cert.expiry_date),
+        _canon_text(cert.revoke_date),
         cert.status or "",
         bool(cert.active),
-        cert.specializations or "",
-        cert.specialization_ids or "",
+        _canon_json_like(cert.specializations),
+        _canon_text(cert.specialization_ids),
         bool(cert.is_filtered),
     )
 

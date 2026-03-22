@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 import inspect
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote_plus, quote
 
 import aiohttp
 
@@ -35,7 +35,14 @@ from database import Certificate
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 API_TARGET = "api.licenses.uz/v1/register/open_source"
-REGISTRY_BY_NUMBER_URL = "https://license.gov.uz/registry?filter%5Bnumber%5D={number}"
+TARGET_DOCUMENT_ID = 4409
+TARGET_DOCUMENT_TYPE = "LICENSE"
+REGISTRY_BY_NUMBER_URL = (
+    "https://license.gov.uz/registry"
+    "?filter%5Bnumber%5D={number}"
+    f"&filter%5Bdocument_id%5D={TARGET_DOCUMENT_ID}"
+    f"&filter%5Bdocument_type%5D={TARGET_DOCUMENT_TYPE}"
+)
 
 REGISTRY_URL = (
     f"{BASE_URL}/registry"
@@ -115,6 +122,97 @@ def _normalize_number(value: Any) -> str:
         return str(int(raw))
     except (TypeError, ValueError):
         return raw
+
+
+_NUMBER_CHAR_MAP = str.maketrans({
+    # Uzbek Cyrillic
+    "А": "A", "В": "V", "Е": "E", "К": "K", "М": "M", "Н": "N", "О": "O",
+    "Р": "R", "С": "S", "Т": "T", "У": "U", "Х": "X", "Ҳ": "H", "Қ": "Q",
+    "Ғ": "G", "Ў": "O", "Ё": "YO", "Й": "Y", "Л": "L", "Д": "D", "Ж": "J",
+    "З": "Z", "И": "I", "П": "P", "Ф": "F", "Ч": "CH", "Ш": "SH", "Я": "YA",
+    "Ю": "YU", "Ц": "S", "Ь": "", "Ъ": "", "Ы": "I", "Э": "E",
+    # lowercase variants
+    "а": "A", "в": "V", "е": "E", "к": "K", "м": "M", "н": "N", "о": "O",
+    "р": "R", "с": "S", "т": "T", "у": "U", "х": "X", "ҳ": "H", "қ": "Q",
+    "ғ": "G", "ў": "O", "ё": "YO", "й": "Y", "л": "L", "д": "D", "ж": "J",
+    "з": "Z", "и": "I", "п": "P", "ф": "F", "ч": "CH", "ш": "SH", "я": "YA",
+    "ю": "YU", "ц": "S", "ь": "", "ъ": "", "ы": "I", "э": "E",
+})
+
+
+def _canonical_number_key(value: Any) -> str:
+    """Normalize document numbers for stable matching across scripts and spacing."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = _normalize_number(raw)
+    normalized = normalized.translate(_NUMBER_CHAR_MAP).upper()
+    return "".join(ch for ch in normalized if ch.isalnum())
+
+
+def _number_query_variants(value: str) -> List[str]:
+    """Build conservative query variants (spacing/cleanup) for number lookup."""
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    variants: List[str] = []
+
+    def _add(v: str):
+        vv = str(v or "").strip()
+        if vv and vv not in variants:
+            variants.append(vv)
+
+    _add(raw)
+    compact = " ".join(raw.split())
+    _add(compact)
+
+    # If format is like MT0293 / МТ1171, add "MT 0293" / "МТ 1171" variant.
+    m = __import__("re").match(r"^([A-Za-zА-Яа-яЁёЎўҚқҒғҲҳ]+)\s*([0-9]+)$", compact)
+    if m:
+        letters = m.group(1)
+        digits = m.group(2)
+        _add(f"{letters} {digits}")
+
+    return variants
+
+
+def _pick_best_certificate_for_number(items: List[Dict[str, Any]], expected_number: str) -> Optional[Dict[str, Any]]:
+    """
+    Prefer the best match for one document number:
+    1) exact normalized number + target document filters,
+    2) active certificates first,
+    3) ACTIVE status over others,
+    4) highest register_id as fallback.
+    """
+    expected_key = _canonical_number_key(expected_number)
+    if not expected_key:
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+    for item in items:
+        item_key = _canonical_number_key(item.get("number"))
+        if item_key != expected_key:
+            continue
+
+        item_doc_id = item.get("document_id")
+        item_doc_type = str(item.get("type") or "").upper()
+        if item_doc_id != TARGET_DOCUMENT_ID or item_doc_type != TARGET_DOCUMENT_TYPE:
+            continue
+
+        candidates.append(item)
+
+    if not candidates:
+        return None
+
+    def _rank(cert_item: Dict[str, Any]) -> tuple:
+        is_active = 1 if bool(cert_item.get("active")) else 0
+        status_val = str((cert_item.get("status") or {}).get("status") or "").upper()
+        is_status_active = 1 if status_val == "ACTIVE" else 0
+        register_id = int(cert_item.get("register_id") or 0)
+        return (is_active, is_status_active, register_id)
+
+    return max(candidates, key=_rank)
 
 
 _CYR_TO_LAT = str.maketrans({
@@ -243,7 +341,7 @@ class LicenseParserV4:
             items        = len(inner.get("certificates") or [])
             logger.debug(f"API response ushlandi: page={current_page}, items={items}")
 
-            await self._response_queue.put(data)
+            await self._response_queue.put({"url": url, "payload": data})
 
         except Exception as e:
             logger.debug(f"_handle_response xato (o'tkazildi): {e}")
@@ -297,10 +395,14 @@ class LicenseParserV4:
         while asyncio.get_event_loop().time() < deadline:
             remaining = deadline - asyncio.get_event_loop().time()
             try:
-                data = await asyncio.wait_for(
+                queue_item = await asyncio.wait_for(
                     self._response_queue.get(), timeout=min(2.0, remaining)
                 )
             except asyncio.TimeoutError:
+                continue
+
+            data = queue_item.get("payload") if isinstance(queue_item, dict) else queue_item
+            if not isinstance(data, dict):
                 continue
 
             inner        = data.get("data") or {}
@@ -539,23 +641,21 @@ class LicenseParserV4:
         ordered_numbers = sorted(normalized_targets)
         total = len(ordered_numbers)
         for idx, number in enumerate(ordered_numbers, 1):
-            registry_url = REGISTRY_BY_NUMBER_URL.format(number=quote_plus(number))
             try:
-                await self._drain_old_responses()
-
-                logger.debug(f"Auto-update number lookup: {number} | {registry_url}")
-                await self._page.goto(registry_url, wait_until="domcontentloaded", timeout=60_000)
-
-                payload = await self._wait_for_registry_number_api(number, timeout=25.0)
-                items = (payload.get("data") or {}).get("certificates") or []
-
                 chosen: Optional[Dict[str, Any]] = None
-                for item in items:
-                    if _normalize_number(item.get("number")) == number:
-                        chosen = item
+
+                for query_number in _number_query_variants(number):
+                    await self._drain_old_responses()
+
+                    registry_url = REGISTRY_BY_NUMBER_URL.format(number=quote(query_number))
+                    logger.debug(f"Auto-update number lookup: {number} -> {query_number} | {registry_url}")
+                    await self._page.goto(registry_url, wait_until="domcontentloaded", timeout=60_000)
+
+                    payload = await self._wait_for_registry_number_api(query_number, timeout=25.0)
+                    items = (payload.get("data") or {}).get("certificates") or []
+                    chosen = _pick_best_certificate_for_number(items, number)
+                    if chosen:
                         break
-                if not chosen and items:
-                    chosen = items[0]
 
                 if chosen:
                     cert = _api_item_to_cert(chosen)
@@ -595,16 +695,38 @@ class LicenseParserV4:
         Registry sahifasidan ketgan API response ni queue dan topadi.
         expected_number ga mos certificates response kelmaguncha kutadi.
         """
-        expected = _normalize_number(expected_number)
+        expected = _canonical_number_key(expected_number)
         deadline = asyncio.get_event_loop().time() + timeout
 
         while asyncio.get_event_loop().time() < deadline:
             remaining = deadline - asyncio.get_event_loop().time()
             try:
-                payload = await asyncio.wait_for(
+                queue_item = await asyncio.wait_for(
                     self._response_queue.get(), timeout=min(2.0, remaining)
                 )
             except asyncio.TimeoutError:
+                continue
+
+            if not isinstance(queue_item, dict):
+                continue
+
+            source_url = str(queue_item.get("url") or "")
+            payload = queue_item.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+
+            # Ensure this is the strict request shape used for number-based update.
+            parsed = urlparse(source_url)
+            qs = parse_qs(parsed.query)
+            req_number = unquote_plus((qs.get("number") or [""])[0])
+            req_doc_id = (qs.get("document_id") or [""])[0]
+            req_doc_type = str((qs.get("document_type") or [""])[0]).upper()
+
+            if _canonical_number_key(req_number) != expected:
+                continue
+            if req_doc_id and str(req_doc_id) != str(TARGET_DOCUMENT_ID):
+                continue
+            if req_doc_type and req_doc_type != TARGET_DOCUMENT_TYPE:
                 continue
 
             items = (payload.get("data") or {}).get("certificates") or []
@@ -612,7 +734,7 @@ class LicenseParserV4:
                 continue
 
             for item in items:
-                if _normalize_number(item.get("number")) == expected:
+                if _canonical_number_key(item.get("number")) == expected:
                     return payload
 
         raise TimeoutError(f"Registry background API timeout, number={expected}")
