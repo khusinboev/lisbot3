@@ -6,6 +6,7 @@ Xato bo'lsa oldingi pagelar saqlanib qoladi.
 import asyncio
 import os
 import html
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -296,6 +297,41 @@ async def _send_pdf_to_admins(output_path: str, cert: Certificate):
             logger.debug(f"PDF o'chirish xato (path={output_path}): {e}")
 
 
+async def _send_file_to_admins(file_path: str, caption: str = "", remove_after_send: bool = True):
+    targets = _admin_chat_ids()
+    if not targets:
+        if remove_after_send and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.debug(f"Fayl o'chirish xato (path={file_path}): {e}")
+        return
+
+    try:
+        for chat_id in targets:
+            try:
+                await asyncio.wait_for(
+                    bot.send_document(
+                        chat_id=chat_id,
+                        document=FSInputFile(file_path),
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    timeout=20.0,
+                )
+                await asyncio.sleep(AUTO_NOTIFY_DELAY_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning(f"Admin file timeout (chat_id={chat_id}, path={file_path})")
+            except Exception as e:
+                logger.debug(f"Admin file xato (chat_id={chat_id}, path={file_path}): {e}")
+    finally:
+        if remove_after_send and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.debug(f"Fayl o'chirish xato (path={file_path}): {e}")
+
+
 def _resolve_timezone(tz_name: str):
     try:
         return ZoneInfo(tz_name)
@@ -485,7 +521,12 @@ async def _run_auto_update_once():
 
             await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
 
-        missing = max(0, len(targets) - len(found_map))
+        found_numbers = {_normalize_number(k) for k in found_map.keys()}
+        missing_numbers = sorted(
+            _normalize_number(number) for number in targets
+            if _normalize_number(number) not in found_numbers
+        )
+        missing = len(missing_numbers)
 
         await _notify_admins(
             f"✅ <b>Auto-update yakunlandi</b>\n\n"
@@ -497,6 +538,26 @@ async def _run_auto_update_once():
             f"❓ Topilmadi: <b>{missing}</b>\n"
             f"⚠️ Xatolar: <b>{failed}</b>"
         )
+
+        if missing_numbers:
+            report_caption = (
+                "📄 <b>Auto-update topilmaganlar ro'yxati</b>\n"
+                f"Jami: <b>{len(missing_numbers)}</b>"
+            )
+            report_lines = [
+                "Auto-update topilmagan sertifikat raqamlari",
+                f"Jami: {len(missing_numbers)}",
+                "",
+            ]
+            report_lines.extend(missing_numbers)
+            report_text = "\n".join(report_lines)
+
+            fd, report_path = tempfile.mkstemp(prefix="auto_update_missing_", suffix=".txt")
+            os.close(fd)
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report_text)
+
+            await _send_file_to_admins(report_path, caption=report_caption, remove_after_send=True)
 
     except Exception as e:
         logger.error(f"Auto-update xato: {e}")
