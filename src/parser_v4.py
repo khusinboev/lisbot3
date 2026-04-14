@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -139,6 +140,21 @@ _NUMBER_CHAR_MAP = str.maketrans({
     "ю": "YU", "ц": "S", "ь": "", "ъ": "", "ы": "I", "э": "E",
 })
 
+_LAT_TO_CYR_PREFIX_MAP = str.maketrans({
+    "A": "А", "B": "В", "D": "Д", "E": "Е", "F": "Ф", "G": "Г",
+    "H": "Ҳ", "I": "И", "J": "Ж", "K": "К", "L": "Л", "M": "М",
+    "N": "Н", "O": "О", "P": "П", "Q": "Қ", "R": "Р", "S": "С",
+    "T": "Т", "U": "У", "V": "В", "X": "Х", "Y": "Й", "Z": "З",
+})
+
+
+def _prefix_to_latin(value: str) -> str:
+    return str(value or "").translate(_NUMBER_CHAR_MAP)
+
+
+def _prefix_to_cyrillic(value: str) -> str:
+    return str(value or "").upper().translate(_LAT_TO_CYR_PREFIX_MAP)
+
 
 def _canonical_number_key(value: Any) -> str:
     """Normalize document numbers for stable matching across scripts and spacing."""
@@ -167,12 +183,21 @@ def _number_query_variants(value: str) -> List[str]:
     compact = " ".join(raw.split())
     _add(compact)
 
-    # If format is like MT0293 / МТ1171, add "MT 0293" / "МТ 1171" variant.
-    m = __import__("re").match(r"^([A-Za-zА-Яа-яЁёЎўҚқҒғҲҳ]+)\s*([0-9]+)$", compact)
+    # If format is like MT0293 / МТ1171 / OT 0006, generate script + spacing variants.
+    m = re.match(r"^([A-Za-zА-Яа-яЁёЎўҚқҒғҲҳ]+)\s*([0-9]+)$", compact)
     if m:
-        letters = m.group(1)
+        letters = m.group(1).strip()
         digits = m.group(2)
-        _add(f"{letters} {digits}")
+
+        letter_variants: List[str] = []
+        for candidate in (letters, _prefix_to_latin(letters), _prefix_to_cyrillic(letters)):
+            normalized_candidate = str(candidate or "").strip()
+            if normalized_candidate and normalized_candidate not in letter_variants:
+                letter_variants.append(normalized_candidate)
+
+        for letter_variant in letter_variants:
+            _add(f"{letter_variant}{digits}")
+            _add(f"{letter_variant} {digits}")
 
     return variants
 
@@ -667,7 +692,7 @@ class LicenseParserV4:
                     raise
                 logger.warning(f"fetch_by_document_numbers number={number} xato: {e}")
                 if error_callback:
-                    result = error_callback(idx, total, e)
+                    result = error_callback(idx, total, number, e)
                     if inspect.isawaitable(result):
                         await result
 

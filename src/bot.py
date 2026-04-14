@@ -454,6 +454,8 @@ async def _run_auto_update_once():
             await _notify_admins("ℹ️ <b>Auto-update:</b> saralangan sertifikat topilmadi")
             return
 
+        lookup_errors: dict[str, str] = {}
+
         await _notify_admins(
             f"🔄 <b>Auto-update boshlandi</b>\n\n"
             f"Saralangan hujjatlar: <b>{len(targets)}</b>\n"
@@ -472,11 +474,16 @@ async def _run_auto_update_once():
                     f"🎯 Topildi: <b>{found}/{needed}</b>"
                 )
 
+        async def on_lookup_error(done: int, total: int, number: str, err: Exception):
+            normalized_number = _normalize_number(number)
+            lookup_errors[normalized_number] = str(err).strip() or err.__class__.__name__
+
         found_map = await parser_local.fetch_by_document_numbers(
             target_numbers=targets,
             max_pages=AUTO_UPDATE_MAX_PAGES,
             progress_callback=on_progress,
             continue_on_page_error=True,
+            error_callback=on_lookup_error,
             cooldown_every_pages=SCRAPE_COOLDOWN_EVERY_PAGES,
             cooldown_seconds=SCRAPE_COOLDOWN_SECONDS,
         )
@@ -525,8 +532,10 @@ async def _run_auto_update_once():
         missing_numbers = sorted(
             _normalize_number(number) for number in targets
             if _normalize_number(number) not in found_numbers
+            and _normalize_number(number) not in lookup_errors
         )
         missing = len(missing_numbers)
+        lookup_failed = len(lookup_errors)
 
         await _notify_admins(
             f"✅ <b>Auto-update yakunlandi</b>\n\n"
@@ -536,20 +545,36 @@ async def _run_auto_update_once():
             f"♻️ O'zgargani update qilindi: <b>{changed}</b>\n"
             f"➖ O'zgarmagan: <b>{unchanged}</b>\n"
             f"❓ Topilmadi: <b>{missing}</b>\n"
-            f"⚠️ Xatolar: <b>{failed}</b>"
+            f"🚫 Lookup xatolari: <b>{lookup_failed}</b>\n"
+            f"⚠️ DB xatolari: <b>{failed}</b>"
         )
 
-        if missing_numbers:
+        if missing_numbers or lookup_errors:
             report_caption = (
-                "📄 <b>Auto-update topilmaganlar ro'yxati</b>\n"
-                f"Jami: <b>{len(missing_numbers)}</b>"
+                "📄 <b>Auto-update faild report</b>\n"
+                f"Topilmadi: <b>{len(missing_numbers)}</b> | "
+                f"Lookup xatolari: <b>{lookup_failed}</b>"
             )
             report_lines = [
-                "Auto-update topilmagan sertifikat raqamlari",
-                f"Jami: {len(missing_numbers)}",
+                "Auto-update faild report",
+                f"Target: {len(targets)}",
+                f"API'dan topildi: {len(found_map)}",
+                f"Topilmadi: {len(missing_numbers)}",
+                f"Lookup xatolari: {lookup_failed}",
+                f"DB xatolari: {failed}",
                 "",
             ]
-            report_lines.extend(missing_numbers)
+
+            if missing_numbers:
+                report_lines.append("=== TOPILMADI ===")
+                report_lines.extend(missing_numbers)
+                report_lines.append("")
+
+            if lookup_errors:
+                report_lines.append("=== LOOKUP XATOLARI ===")
+                for number in sorted(lookup_errors):
+                    report_lines.append(f"{number} | {lookup_errors[number]}")
+
             report_text = "\n".join(report_lines)
 
             fd, report_path = tempfile.mkstemp(prefix="auto_update_missing_", suffix=".txt")
