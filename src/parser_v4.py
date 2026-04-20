@@ -350,7 +350,7 @@ class LicenseParserV4:
             url = response.url
             if API_TARGET not in url:
                 return
-            if "stat" in url or "search" in url:
+            if "/statistics" in url or "_stats" in url:
                 return
             if response.status != 200:
                 return
@@ -474,7 +474,7 @@ class LicenseParserV4:
                     await asyncio.sleep(random.uniform(2.0, 4.0))
                 except Exception:
                     pass
-                raw = await self._wait_for_api(page_0indexed, timeout=25.0)
+                raw = await self._wait_for_api(page_0indexed, timeout=45.0)
 
             if raw:
                 return raw
@@ -676,7 +676,7 @@ class LicenseParserV4:
                     logger.debug(f"Auto-update number lookup: {number} -> {query_number} | {registry_url}")
                     await self._page.goto(registry_url, wait_until="domcontentloaded", timeout=60_000)
 
-                    payload = await self._wait_for_registry_number_api(query_number, timeout=25.0)
+                    payload = await self._wait_for_registry_number_api(query_number, timeout=45.0)
                     items = (payload.get("data") or {}).get("certificates") or []
                     chosen = _pick_best_certificate_for_number(items, number)
                     if chosen:
@@ -743,11 +743,11 @@ class LicenseParserV4:
             # Ensure this is the strict request shape used for number-based update.
             parsed = urlparse(source_url)
             qs = parse_qs(parsed.query)
-            req_number = unquote_plus((qs.get("number") or [""])[0])
-            req_doc_id = (qs.get("document_id") or [""])[0]
-            req_doc_type = str((qs.get("document_type") or [""])[0]).upper()
+            req_number = unquote_plus((qs.get("number") or qs.get("filter[number]") or [""])[0])
+            req_doc_id = (qs.get("document_id") or qs.get("filter[document_id]") or [""])[0]
+            req_doc_type = str((qs.get("document_type") or qs.get("filter[document_type]") or [""])[0]).upper()
 
-            if _canonical_number_key(req_number) != expected:
+            if req_number and _canonical_number_key(req_number) != expected:
                 continue
             if req_doc_id and str(req_doc_id) != str(TARGET_DOCUMENT_ID):
                 continue
