@@ -674,9 +674,12 @@ class LicenseParserV4:
 
                     registry_url = REGISTRY_BY_NUMBER_URL.format(number=quote(query_number))
                     logger.debug(f"Auto-update number lookup: {number} -> {query_number} | {registry_url}")
-                    await self._page.goto(registry_url, wait_until="domcontentloaded", timeout=60_000)
-
-                    payload = await self._wait_for_registry_number_api(query_number, timeout=45.0)
+                    try:
+                        await self._page.goto(registry_url, wait_until="domcontentloaded", timeout=60_000)
+                        payload = await self._wait_for_registry_number_api(query_number, timeout=45.0)
+                    except (TimeoutError, asyncio.TimeoutError) as _te:
+                        logger.debug(f"Variant '{query_number}' timeout — keyingi variant sinanadi: {_te}")
+                        continue
                     items = (payload.get("data") or {}).get("certificates") or []
                     chosen = _pick_best_certificate_for_number(items, number)
                     if chosen:
@@ -755,8 +758,10 @@ class LicenseParserV4:
                 continue
 
             items = (payload.get("data") or {}).get("certificates") or []
+            # Bo'sh javob = URL filtri mos keldi, lekin bu number bazada yo'q.
+            # Darhol qaytamiz — kutishni davom ettirish xato (timeout chiqaradi).
             if not items:
-                continue
+                return payload
 
             for item in items:
                 if _canonical_number_key(item.get("number")) == expected:

@@ -265,6 +265,60 @@ async def _notify_admins(text: str):
             logger.debug(f"Admin notification xato (chat_id={chat_id}): {e}")
 
 
+async def _notify_admins_edit_or_send(text: str, msg_refs: Optional[dict] = None) -> dict:
+    """
+    Har bir admin uchun:
+      - msg_refs[chat_id] mavjud bo'lsa → xabarni edit qilishga urinadi
+      - Muvaffaqiyatsiz (o'chirilgan, 48h o'tgan, vs) → yangi xabar yuboradi
+    Qaytaradi: {chat_id: message_id}
+    """
+    targets = _admin_chat_ids()
+    if not targets:
+        logger.debug("ADMIN_IDS bo'sh, edit-or-send yuborilmadi")
+        return {}
+
+    result_refs: dict = {}
+    if msg_refs is None:
+        msg_refs = {}
+
+    for chat_id in targets:
+        existing_msg_id = msg_refs.get(chat_id)
+        sent_msg = None
+
+        if existing_msg_id:
+            try:
+                sent_msg = await asyncio.wait_for(
+                    bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=existing_msg_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Edit timeout (chat_id={chat_id}, msg_id={existing_msg_id})")
+            except Exception:
+                pass  # o'chirilgan yoki eski xabar — yangi yuboramiz
+
+        if sent_msg is None:
+            try:
+                sent_msg = await asyncio.wait_for(
+                    bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                    timeout=10.0,
+                )
+                await asyncio.sleep(AUTO_NOTIFY_DELAY_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning(f"Send timeout (chat_id={chat_id})")
+            except Exception as e:
+                logger.debug(f"Edit-or-send xato (chat_id={chat_id}): {e}")
+
+        if sent_msg is not None:
+            result_refs[chat_id] = sent_msg.message_id
+
+    return result_refs
+
+
 async def _send_pdf_to_admins(output_path: str, cert: Certificate):
     targets = _admin_chat_ids()
     if not targets:
@@ -356,7 +410,7 @@ async def _run_auto_check_once():
         )
         return
 
-    await _notify_admins(
+    msg_refs: dict = await _notify_admins_edit_or_send(
         "🔎 <b>Auto-check boshlandi</b>\n\n"
         "Yangi sertifikatlar tekshirilmoqda..."
     )
@@ -367,7 +421,6 @@ async def _run_auto_check_once():
         parser_local = LicenseParser()
         await parser_local.init_browser(headless=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         existing_numbers = await db.get_existing_numbers_set()
         new_certs = await parser_local.fetch_new_since(
@@ -376,7 +429,10 @@ async def _run_auto_check_once():
         )
 
         if not new_certs:
-            await _notify_admins("✅ <b>Auto-check:</b> yangi sertifikat topilmadi")
+            await _notify_admins_edit_or_send(
+                "✅ <b>Auto-check:</b> yangi sertifikat topilmadi",
+                msg_refs,
+            )
             return
 
         inserted = 0
@@ -403,35 +459,35 @@ async def _run_auto_check_once():
                 logger.error(f"Auto-check item xato (uuid={cert.uuid}): {e}")
 
             if idx % AUTO_CHECK_NOTIFY_EVERY_ITEMS == 0 or idx == total:
-                await _notify_admins(
+                msg_refs = await _notify_admins_edit_or_send(
                     f"🔎 <b>Auto-check davom etmoqda</b>\n\n"
                     f"{idx}/{total}\n"
                     f"💾 Bazaga: <b>{inserted}</b>\n"
                     f"🎯 Filterga mos: <b>{filtered}</b>\n"
                     f"📄 PDF yuklandi: <b>{pdf_downloaded}</b>\n"
                     f"📨 PDF yuborildi: <b>{pdf_sent}</b>\n"
-                    f"⚠️ Xatolar: <b>{failed}</b>"
+                    f"⚠️ Xatolar: <b>{failed}</b>",
+                    msg_refs,
                 )
 
             await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
 
-        await _notify_admins(
+        msg_refs = await _notify_admins_edit_or_send(
             f"✅ <b>Auto-check yakunlandi</b>\n\n"
             f"🆕 Topildi: <b>{total}</b>\n"
             f"💾 Bazaga: <b>{inserted}</b>\n"
             f"🎯 Filterga mos: <b>{filtered}</b>\n"
             f"📄 PDF yuklandi: <b>{pdf_downloaded}</b>\n"
             f"📨 PDF yuborildi: <b>{pdf_sent}</b>\n"
-            f"⚠️ Xatolar: <b>{failed}</b>"
+            f"⚠️ Xatolar: <b>{failed}</b>",
+            msg_refs,
         )
-
-        if pdf_sent == 0:
-            await _notify_admins("ℹ️ <b>Auto-check:</b> yuborishga saralangan PDF topilmadi")
 
     except Exception as e:
         logger.error(f"Auto-check xato: {e}")
-        await _notify_admins(
-            f"❌ <b>Auto-check xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>"
+        await _notify_admins_edit_or_send(
+            f"❌ <b>Auto-check xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>",
+            msg_refs,
         )
     finally:
         if parser_local:
@@ -447,6 +503,7 @@ async def _run_auto_update_once():
         return
 
     parser_local: Optional[LicenseParser] = None
+    msg_refs: dict = {}
 
     try:
         targets = await db.get_filtered_numbers_set()
@@ -456,22 +513,24 @@ async def _run_auto_update_once():
 
         lookup_errors: dict[str, str] = {}
 
-        await _notify_admins(
+        msg_refs = await _notify_admins_edit_or_send(
             f"🔄 <b>Auto-update boshlandi</b>\n\n"
             f"Saralangan hujjatlar: <b>{len(targets)}</b>\n"
-            f"Qidiruv URL: <code>https://license.gov.uz/registry?filter%5Bnumber%5D=...</code>\n"
-            f"API: <code>/v1/register/open_source?number=...&page=0&size=10</code>"
+            f"Qidiruv: <code>registry?filter[number]=...</code>"
         )
 
         parser_local = LicenseParser()
         await parser_local.init_browser(headless=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         async def on_progress(done: int, total: int, found: int, needed: int):
+            nonlocal msg_refs
             if done % AUTO_UPDATE_PROGRESS_EVERY_PAGES == 0 or done == total:
-                await _notify_admins(
+                msg_refs = await _notify_admins_edit_or_send(
                     f"🔄 <b>Auto-update qidiruv davom etmoqda</b>\n\n"
                     f"🔎 Tekshirildi: <b>{done}/{total}</b>\n"
-                    f"🎯 Topildi: <b>{found}/{needed}</b>"
+                    f"🎯 Topildi: <b>{found}/{needed}</b>",
+                    msg_refs,
                 )
 
         async def on_lookup_error(done: int, total: int, number: str, err: Exception):
@@ -493,6 +552,11 @@ async def _run_auto_update_once():
         inserted = 0
         failed = 0
         processed = 0
+        pdf_sent = 0
+        pdf_downloaded = 0
+
+        # DB bosqichi uchun alohida msg_refs (qidiruv xabarini o'zgartirmaymiz)
+        db_msg_refs: dict = {}
 
         for number, cert in found_map.items():
             processed += 1
@@ -509,6 +573,19 @@ async def _run_auto_update_once():
                         changed += 1
                     else:
                         inserted += 1
+
+                    # O'zgargan yoki yangi filtered sertifikatni adminlarga yuborish
+                    if cert.is_filtered and cert.uuid:
+                        prefix = "♻️ <b>Yangilandi</b>" if has_old else "🆕 <b>Yangi sertifikat</b>"
+                        output_path = os.path.join(DOWNLOAD_DIR, f"upd_{cert.uuid}.pdf")
+                        try:
+                            if await parser_local.download_pdf(cert.uuid, output_path):
+                                pdf_downloaded += 1
+                                await _send_pdf_to_admins(output_path, cert)
+                                pdf_sent += 1
+                        except Exception as pdf_err:
+                            logger.warning(f"Auto-update PDF xato (uuid={cert.uuid}): {pdf_err}")
+
             except Exception as e:
                 failed += 1
                 logger.error(f"Auto-update DB xato (number={number}, uuid={cert.uuid}): {e}")
@@ -517,13 +594,15 @@ async def _run_auto_update_once():
                 processed % AUTO_UPDATE_PROGRESS_EVERY_PAGES == 0
                 or processed == len(found_map)
             ):
-                await _notify_admins(
+                db_msg_refs = await _notify_admins_edit_or_send(
                     f"🔄 <b>Auto-update DB bosqichi</b>\n\n"
                     f"💾 Tekshirildi: <b>{processed}/{len(found_map)}</b>\n"
-                    f"🆕 Yangi qo'shildi: <b>{inserted}</b>\n"
-                    f"♻️ O'zgargani update qilindi: <b>{changed}</b>\n"
+                    f"🆕 Yangi: <b>{inserted}</b>\n"
+                    f"♻️ Yangilandi: <b>{changed}</b>\n"
                     f"➖ O'zgarmagan: <b>{unchanged}</b>\n"
-                    f"⚠️ Xatolar: <b>{failed}</b>"
+                    f"📄 PDF yuborildi: <b>{pdf_sent}</b>\n"
+                    f"⚠️ Xatolar: <b>{failed}</b>",
+                    db_msg_refs,
                 )
 
             await asyncio.sleep(AUTO_REQUEST_ITEM_DELAY_SECONDS)
@@ -537,16 +616,18 @@ async def _run_auto_update_once():
         missing = len(missing_numbers)
         lookup_failed = len(lookup_errors)
 
-        await _notify_admins(
+        await _notify_admins_edit_or_send(
             f"✅ <b>Auto-update yakunlandi</b>\n\n"
             f"🧾 Target: <b>{len(targets)}</b>\n"
             f"🔎 API'dan topildi: <b>{len(found_map)}</b>\n"
             f"🆕 Yangi qo'shildi: <b>{inserted}</b>\n"
-            f"♻️ O'zgargani update qilindi: <b>{changed}</b>\n"
+            f"♻️ Yangilandi: <b>{changed}</b>\n"
             f"➖ O'zgarmagan: <b>{unchanged}</b>\n"
+            f"📄 PDF yuborildi: <b>{pdf_sent}</b>\n"
             f"❓ Topilmadi: <b>{missing}</b>\n"
             f"🚫 Lookup xatolari: <b>{lookup_failed}</b>\n"
-            f"⚠️ DB xatolari: <b>{failed}</b>"
+            f"⚠️ DB xatolari: <b>{failed}</b>",
+            db_msg_refs,
         )
 
         if missing_numbers or lookup_errors:
@@ -586,8 +667,9 @@ async def _run_auto_update_once():
 
     except Exception as e:
         logger.error(f"Auto-update xato: {e}")
-        await _notify_admins(
-            f"❌ <b>Auto-update xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>"
+        await _notify_admins_edit_or_send(
+            f"❌ <b>Auto-update xato</b>\n\n<code>{html.escape(str(e))[:300]}</code>",
+            msg_refs,
         )
     finally:
         if parser_local:
