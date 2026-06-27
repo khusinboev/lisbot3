@@ -1,3 +1,4 @@
+
 """Application settings and environment parsing."""
 import os
 from pathlib import Path

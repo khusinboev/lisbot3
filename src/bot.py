@@ -1,3 +1,4 @@
+
 """
 src/bot.py
 Har bir page dan keyin darrov bazaga kiritiladi.

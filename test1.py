@@ -1,3 +1,4 @@
+
 """
 test1.py — Camoufox + virtual display
 Sayt ochiladi, screenshot olinadi, API JSON ushlandi → Telegram ga yuboriladi.

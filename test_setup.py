@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 test_license_parser.py - License.gov.uz parser test fayli
 Bitta faylda hamma narsa: parser + test

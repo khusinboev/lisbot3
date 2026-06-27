@@ -1,3 +1,4 @@
+
 """
 src/database.py — API response ga mos yangilangan schema.
 """

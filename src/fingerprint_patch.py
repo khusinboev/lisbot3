@@ -1,3 +1,4 @@
+
 """
 src/fingerprint_patch.py
 Full browser fingerprint hardening — 8 vectors.

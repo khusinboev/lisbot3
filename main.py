@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-"""
-License Bot - Telegram bot for scraping license.gov.uz
-"""
 import asyncio
 import sys
 from pathlib import Path
