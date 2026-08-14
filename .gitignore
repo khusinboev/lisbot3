@@ -30,3 +30,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# claude — .claude/ ichida infra/server eslatmalari bor, commit qilinmaydi
+.claude/
